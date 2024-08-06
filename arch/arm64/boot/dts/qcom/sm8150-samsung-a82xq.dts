@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
+/dts-v1/;
+
+#include "sm8150.dtsi"
+
+/*
+ * Delete all generic (sm8150.dtsi) reserved
+ * memory mappings which are different in this device.
+ */
+/delete-node/ &gpu_mem;
+/delete-node/ &qseecom_mem;
+/delete-node/ &wlan_mem;
+
+/ {
+        model = "Samsung A82XQ PROJECT Rev01";
+        compatible = "qcom,sm8150-mtp", "qcom,sm8150", "qcom,mtp";
+        chassis-type = "handset";
+
+        qcom,msm-id = <0x16d 0>;
+        qcom,board-id = <0x10008 0x01>;
+
+        reserved-memory {
+                #address-cells = <2>;
+                #size-cells = <2>;
+                ranges;
+
+                xbl_aop_mem: memory@85e00000 {
+                        compatible = "removed-dma-pool";
+                        reg = <0x0 0x85e00000 0x0 0x140000>;
+                        no-map;
+                };
+
+                removed_regions: memory@86200000 {
+                        compatible = "removed-dma-pool";
+                        reg = <0x00 0x86200000 0x00 0x5fe4000>;
+                        no-map;
+                };
+
+                pil_ipa_fw_regions: memory@8c1e4000 {
+                        compatible = "removed-dma-pool";
+                        reg = <0x0 0x8c1e4000 0x0 0x10000>;
+                        no-map;
+                };
+
+                pil_ipa_gsi_region: memory@8c1f4000 {
+                        compatible = "removed-dma-pool";
+                        reg = <0x0 0x8c1f4000 0x0 0xa000>;
+                        no-map;
+                };
+
+                gpu_mem: memory@8c1fe000 {
+                        compatible = "removed-dma-pool";
+                        reg = <0x0 0x8c1fe000 0x0 0x2000>;
+                        no-map;
+                };
+
+                wlan_mem: memory@8c200000 {
+                        compatible = "removed-dma-pool";
+                        reg = <0x0 0x8c200000 0x0 0x180000>;
+                        no-map;
+                        status = "ok";
+                }
+
+                pil_slpi_region: memory@8c400000 {
+                        compatible = "removed-dma-pool";
+                        reg = <0x00 0x8c400000 0x00 0x1400000>;
+                        no-map;
+                };
+
+                pil_wlan_fw_region: memory@8c200000 {
+                        compatible = "removed-dma-pool";
+                        reg = <0x0 0x8c200000 0x0 0x180000>;
+                        no-map;
+                };
+
+                pil_npu_region: memory@8c380000 {
+                        reg = <0x00 0x8c380000 0x00 0x80000>;
+                        no-map;
+                };
+
+                modem_region: memory@8d800000 {
+                        compatible = "removed-dma-pool";
+                        reg = <0x0 0x8d00000 0x0 0xa000000>;
+                        no-map;
+                }
+
+                pil_spss_region: memory@97800000 {
+                        compatible = "removed-dma-pool";
+                        reg = <0x0 0x97800000 0x0 0x100000>;
+                        no-map;
+                };
+
+                cdsp_regions: memory@97900000 {
+                        compatible = "removed-dma-pool";
+                        reg = <0x0 0x97900000 0x0 0x1a00000>;
+                        no-map;
+                };
+
+                pil_adsp_region: memory@99300000 {
+                        compatible = "removed-dma-pool";
+                        reg = <0x00 0x99300000 0x00 0x2700000>;
+                        no-map;
+                };
+
+                camera_region: memory@9ba0000 {
+                        compatible = "removed-dma-pool";
+                        reg = <0x0 0x9ba00000 0x0 0x500000>;
+                        no-map;
+                };
+
+                pil_video_region: memory@9bf00000 {
+                        compatible = "removed-dma-pool";
+                        reg = <0x0 0x9bf00000 0x0 0x500000>;
+                        no-map;
+                };
+
+                cont_splash_region: memory@9c400000 {
+                        compatible = "removed-dma-pool";
+                        reg = <0x0 0x9c400000 0x0 0x2000000>;
+                };
+
+                pil_buffer_p2_region: memory@a0000000 {
+                        compatible = "removed-dma-pool";
+                        reg = <0x0 0xa0000000 0x0 0x1000000>;
+                        no-map;
+                };
+
+                pil_buffer_p1_region: memory@a1000000 {
+                        compatible = "removed-dma-pool";
+                        reg = <0x00 0xa1000000 0x00 0x2c00000>;
+                        no-map;
+                };
+
+                cdsp_sec_regions: memory@a4c00000 {
+                        compatible = "removed-dma-pool";
+                        reg = <0x00 0xa4c00000 0x00 0x1400000>;
+                        no-map;
+                };
+
+                qseecom_mem: memory@a6000000 {
+                        compatible = "removed-dma-pool";
+                        reg = <0x0 0xa6000000 0x0 0x2400000>;
+                        no-map;
+                };
+
+                uh_heap_region: memory@b0400000 {
+                        compatible = "removed-dma-pool";
+                        reg = <0x0 0xb0400000 0x0 0x1400000>;
+                };
+
+                camera_mem: memory@c200000 {
+                        compatible = "removed-dma-pool";
+                        reg = <0x0 0xc200000 0x0 0x1400000>;
+                }
+
+                qseecom_ta_region: memory@ff000000 {
+                        compatible = "removed-dma-pool";
+                        reg = <0x0 0xff000000 0x0 0x1000000>;
+                };
+        }
+}
