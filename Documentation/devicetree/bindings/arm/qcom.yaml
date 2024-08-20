@@ -914,6 +914,7 @@ properties:
               - microsoft,surface-duo
               - qcom,sm8150-hdk
               - qcom,sm8150-mtp
+              - samsung,a82xq
               - sony,bahamut-generic
               - sony,griffin-generic
           - const: qcom,sm8150
