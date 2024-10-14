@@ -953,6 +953,13 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 	uint32_t pen_btn2 = 0;
 	uint32_t pen_battery = 0;
 
+	static struct task_struct *touch_task = NULL;
+
+	if (touch_task == NULL) {
+		touch_task = current;
+		sched_set_fifo(touch_task);
+	}
+
 	mutex_lock(&ts->lock);
 
 	if (ts->dev_pm_suspend) {
