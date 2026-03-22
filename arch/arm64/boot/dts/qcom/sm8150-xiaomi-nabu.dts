@@ -98,8 +98,8 @@
 			no-map;
 		};
 
-		cdsp_sec_mem: memory@a4c00000 {
-			reg = <0x0 0xa4c00000 0x0 0x3c00000>;
+		cdsp_sec_mem: memory@a8800000 {
+			reg = <0x0 0xa8800000 0x0 0x3c00000>;
 			no-map;
 		};
 
