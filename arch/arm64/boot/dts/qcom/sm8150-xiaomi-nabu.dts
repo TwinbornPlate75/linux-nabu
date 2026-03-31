@@ -130,6 +130,17 @@
 		voltage-max-design-microvolt = <4480000>;
 	};
 
+	xiaomi_keyboard {
+		compatible = "xiaomi,keyboard";
+		pinctrl-names = "pm_kb_active", "pm_kb_suspend";
+		pinctrl-0 = <&xiaomi_keyboard_active>;
+		pinctrl-1 = <&xiaomi_keyboard_suspend>;
+		xiaomi-keyboard,rst-gpio = <&tlmm 49 0x00>;
+		xiaomi-keyboard,in-irq-gpio = <&tlmm 41 0x2001>;
+		xiaomi-keyboard,vdd-gpio = <&tlmm 82 0x00>;
+		status = "ok";
+	};
+
 	bl_vddpos_5p5: bl-vddpos-regulator {
 		compatible = "regulator-fixed";
 		regulator-name = "bl_vddpos_5p5";
@@ -946,51 +957,31 @@
 		};
 	};
 
-	keyboard_active: keyboard-active-state {
-		sleep-pins {
-			pins = "gpio4";
-			function = "gpio";
-			drive-strength = <8>;
-			bias-pull-up;
+	xiaomi_keyboard_mcu {
+		xiaomi_keyboard_suspend: xiaomi_keyboard_suspend {
+			mux {
+				pins = "gpio4";
+				function = "gpio";
+			};
+
+			config {
+				pins = "gpio4";
+				drive-strength = <8>;
+				bias-pull-down;
+			};
 		};
 
-		reset-pins {
-			pins = "gpio49";
-			function = "gpio";
-			drive-strength = <4>;
-			bias-pull-up;
-			output-high;
-		};
+		xiaomi_keyboard_active: xiaomi_keyboard_active {
+			mux {
+				pins = "gpio4";
+				function = "gpio";
+			};
 
-		vdd-pins {
-			pins = "gpio82";
-			function = "gpio";
-			drive-strength = <4>;
-			bias-pull-up;
-			output-high;
-		};
-	};
-
-	keyboard_suspend: keyboard-suspend-state {
-		sleep-pins {
-			pins = "gpio4";
-			function = "gpio";
-			drive-strength = <8>;
-			bias-pull-down;
-		};
-
-		reset-pins {
-			pins = "gpio49";
-			function = "gpio";
-			drive-strength = <4>;
-			bias-pull-down;
-		};
-
-		vdd-pins {
-			pins = "gpio82";
-			function = "gpio";
-			drive-strength = <4>;
-			bias-pull-down;
+			config {
+				pins = "gpio4";
+				drive-strength = <8>;
+				bias-pull-up;
+			};
 		};
 	};
 };
@@ -1079,9 +1070,6 @@
 	vdda18-supply = <&vreg_l12a_1p8>;
 	vdda33-supply = <&vreg_l2a_3p1>;
 	status = "okay";
-	pinctrl-0 = <&keyboard_active>;
-	pinctrl-1 = <&keyboard_suspend>;
-	pinctrl-names = "default", "sleep";
 };
 
 &usb_2_dwc3 {
