@@ -33,95 +33,6 @@ static void xiaomi_keyboard_reset(void)
 	gpio_direction_output(mdata->pdata->rst_gpio, 1);
 }
 
-static ssize_t xiaomi_keyboard_conn_status_show(struct device *dev,
-						struct device_attribute *attr,
-						char *buf)
-{
-	int ret = 0, value = 1;
-	MI_KB_INFO("%s enter\n", __func__);
-	if (!mdata) {
-		MI_KB_ERR("Invalid driver info\n");
-		return ret;
-	}
-
-	mutex_lock(&mdata->rw_mutex);
-	value = mdata->keyboard_conn_status;
-	mutex_unlock(&mdata->rw_mutex);
-
-	return scnprintf(buf, PAGE_SIZE, "%d", value);
-}
-
-static ssize_t xiaomi_keyboard_conn_status_store(struct device *dev,
-						 struct device_attribute *attr,
-						 const char *buf, size_t count)
-{
-	char *cmd;
-	cmd = kzalloc(count + 1, GFP_KERNEL);
-
-	if (!cmd) {
-		MI_KB_ERR("Allocate Meomory Failed\n");
-		goto out;
-	}
-	memcpy(cmd, buf, count);
-
-	if (!mdata)
-		goto out;
-
-	if (!strncmp(cmd, "reset", 5)) {
-		xiaomi_keyboard_reset();
-	} else if (!strncmp(cmd, "enable_keyboard", 15)) {
-		MI_KB_INFO("enable keyboard\n");
-		set_keyboard_status(1);
-	} else if (!strncmp(cmd, "disable_keyboard", 16)) {
-		MI_KB_INFO("disable keyboard\n");
-		set_keyboard_status(0);
-	} else
-		MI_KB_ERR("Undefined CMD: %s\n", cmd);
-out:
-	if (cmd)
-		kfree(cmd);
-	return count;
-}
-
-DEVICE_ATTR(xiaomi_keyboard_conn_status, (S_IRUGO | S_IWUSR | S_IWGRP),
-	    xiaomi_keyboard_conn_status_show,
-	    xiaomi_keyboard_conn_status_store);
-
-static ssize_t xiaomi_keyboard_connected_show(struct device *dev,
-					      struct device_attribute *attr,
-					      char *buf)
-{
-	if (!mdata)
-		return -EINVAL;
-
-	return scnprintf(buf, PAGE_SIZE, "%d", mdata->connected);
-}
-
-static ssize_t xiaomi_keyboard_connected_store(struct device *dev,
-					       struct device_attribute *attr,
-					       const char *buf, size_t count)
-{
-	int rc, val;
-
-	rc = kstrtoint(buf, 10, &val);
-	if (rc)
-		return -EINVAL;
-
-	if (!mdata)
-		return -EINVAL;
-
-	mdata->connected = !!val;
-
-	// Notify the input driver
-	xiaomi_keyboard_connection_change(
-		!!(mdata->connected && mdata->user_enabled));
-
-	return count;
-}
-
-DEVICE_ATTR(xiaomi_keyboard_connected, (S_IRUGO | S_IWUSR | S_IWGRP),
-	    xiaomi_keyboard_connected_show, xiaomi_keyboard_connected_store);
-
 static ssize_t xiaomi_keyboard_enabled_show(struct device *dev,
 					    struct device_attribute *attr,
 					    char *buf)
@@ -129,27 +40,27 @@ static ssize_t xiaomi_keyboard_enabled_show(struct device *dev,
 	if (!mdata)
 		return -EINVAL;
 
-	return scnprintf(buf, PAGE_SIZE, "%d", mdata->user_enabled);
+	return scnprintf(buf, PAGE_SIZE, "%d", mdata->keyboard_is_enable);
 }
 
 static ssize_t xiaomi_keyboard_enabled_store(struct device *dev,
 					     struct device_attribute *attr,
 					     const char *buf, size_t count)
 {
-	int rc, val;
+	int value;
 
-	rc = kstrtoint(buf, 10, &val);
-	if (rc)
+	if (!mdata || kstrtoint(buf, 10, &value))
 		return -EINVAL;
 
-	if (!mdata)
-		return -EINVAL;
-
-	mdata->user_enabled = !!val;
-
-	// Notify the input driver
-	xiaomi_keyboard_connection_change(
-		!!(mdata->connected && mdata->user_enabled));
+	switch (value) {
+	case 0:
+	case 1:
+		set_keyboard_status(value);
+		break;
+	default:
+		xiaomi_keyboard_reset();
+		break;
+	}
 
 	return count;
 }
@@ -158,8 +69,6 @@ DEVICE_ATTR(xiaomi_keyboard_enabled, (S_IRUGO | S_IWUSR | S_IWGRP),
 	    xiaomi_keyboard_enabled_show, xiaomi_keyboard_enabled_store);
 
 static struct attribute *sysfs_attrs[] = {
-	&dev_attr_xiaomi_keyboard_conn_status.attr,
-	&dev_attr_xiaomi_keyboard_connected.attr,
 	&dev_attr_xiaomi_keyboard_enabled.attr,
 	NULL,
 };
@@ -170,17 +79,7 @@ static const struct attribute_group xiaomi_attribute_group = {
 
 static irqreturn_t xiaomi_keyboard_irq_func(int irq, void *data)
 {
-	int value = 0;
-	MI_KB_INFO("keyboard event: wakeup system\n");
 	pm_wakeup_event(&mdata->pdev->dev, 500);
-	value = gpio_get_value_cansleep(mdata->pdata->in_irq_gpio);
-
-	mutex_lock(&mdata->rw_mutex);
-	mdata->keyboard_conn_status = !mdata->keyboard_conn_status;
-	mutex_unlock(&mdata->rw_mutex);
-
-	MI_KB_INFO("keyboard connected status: %d",
-		   mdata->keyboard_conn_status);
 	return IRQ_HANDLED;
 }
 
@@ -235,7 +134,7 @@ static int xiaomi_keyboard_setup_gpio(struct xiaomi_keyboard_platdata *pdata)
 		gpio_direction_output(pdata->rst_gpio, 1);
 
 	mdata->irq = gpio_to_irq(pdata->in_irq_gpio);
-	if (mdata->irq) {
+	if (mdata->irq > 0) {
 		ret = request_threaded_irq(mdata->irq, NULL,
 					   xiaomi_keyboard_irq_func,
 					   IRQF_TRIGGER_RISING | IRQF_ONESHOT,
@@ -258,8 +157,13 @@ static int xiaomi_keyboard_resetup_gpio(struct xiaomi_keyboard_platdata *pdata)
 		return -EINVAL;
 	}
 
-	if (gpio_is_valid(pdata->rst_gpio))
-		gpio_direction_output(pdata->rst_gpio, 0);
+	if (gpio_is_valid(pdata->rst_gpio)) {
+		ret = gpio_direction_output(pdata->rst_gpio, 0);
+		if (ret) {
+			MI_KB_ERR("Failed to set rst_gpio to output low\n");
+			return ret;
+		}
+	}
 
 	free_irq(mdata->irq, mdata);
 
@@ -275,12 +179,11 @@ static int xiaomi_keyboard_parse_dt(struct device *dev)
 
 	pdata = mdata->pdata;
 
-	pdata->rst_gpio = of_get_named_gpio(
-		np, "xiaomi-keyboard,rst-gpio", 0);
+	pdata->rst_gpio = of_get_named_gpio(np, "xiaomi-keyboard,rst-gpio", 0);
 	MI_KB_INFO("xiaomi-kb,reset-gpio=%d\n", pdata->rst_gpio);
 
-	pdata->in_irq_gpio = of_get_named_gpio(
-		np, "xiaomi-keyboard,in-irq-gpio", 0);
+	pdata->in_irq_gpio =
+		of_get_named_gpio(np, "xiaomi-keyboard,in-irq-gpio", 0);
 	MI_KB_INFO("xiaomi-kb,in-irq-gpio=%d\n", pdata->in_irq_gpio);
 
 	pdata->vdd_gpio = of_get_named_gpio(np, "xiaomi-keyboard,vdd-gpio", 0);
@@ -343,12 +246,10 @@ static int xiaomi_keyboard_power_on(void)
 		if (ret) {
 			MI_KB_ERR(
 				"Failed to request xiaomi-keyboard-out-irq gpio\n");
-			goto err_request_vdd_gpio;
+			return ret;
 		}
 	}
 
-	gpio_direction_output(pdata->vdd_gpio, 1);
-err_request_vdd_gpio:
 	return ret;
 }
 
@@ -367,7 +268,6 @@ static void xiaomi_keyboard_power_off(void)
 static int xiaomi_keyboard_suspend(struct device *dev)
 {
 	int ret = 0;
-	MI_KB_INFO("enter\n");
 	if (mdata->pinctrl && mdata->pins_suspend) {
 		ret = (mdata->keyboard_is_enable && mdata->is_usb_exist) ?
 			      0 :
@@ -377,14 +277,12 @@ static int xiaomi_keyboard_suspend(struct device *dev)
 			MI_KB_ERR("Set suspend pin state error:%d\n", ret);
 		}
 	}
-	MI_KB_INFO("exit\n");
 	return ret;
 }
 
 static int xiaomi_keyboard_resume(struct device *dev)
 {
 	int ret = 0;
-	MI_KB_INFO("enter\n");
 	if (!mdata->keyboard_is_enable) {
 		MI_KB_INFO("keyboard_is_enable is false, stop resume.\n");
 		MI_KB_INFO("exit\n");
@@ -396,14 +294,12 @@ static int xiaomi_keyboard_resume(struct device *dev)
 			MI_KB_ERR("Set active pin state error:%d\n", ret);
 		}
 	}
-	MI_KB_INFO("exit\n");
 	return ret;
 }
 
 static int xiaomi_keyboard_pm_suspend(struct device *dev)
 {
 	int ret = 0;
-	MI_KB_INFO("enter\n");
 	enable_irq_wake(mdata->irq);
 	mdata->dev_pm_suspend = true;
 	return ret;
@@ -412,7 +308,6 @@ static int xiaomi_keyboard_pm_suspend(struct device *dev)
 static int xiaomi_keyboard_pm_resume(struct device *dev)
 {
 	int ret = 0;
-	MI_KB_INFO("enter\n");
 	disable_irq_wake(mdata->irq);
 	mdata->dev_pm_suspend = false;
 	return ret;
@@ -433,21 +328,19 @@ static int keyboard_drm_notifier_callback(struct notifier_block *self,
 	if (!data || !mdata)
 		return 0;
 
-	flush_workqueue(mdata->event_wq);
 	if (event == MI_DRM_EARLY_EVENT_BLANK) {
 		if (blank == MI_DRM_BLANK_POWERDOWN) {
 			MI_KB_ERR("keyboard suspend");
 			mdata->is_in_suspend = true;
-			queue_work(mdata->event_wq,
-				   &mdata->suspend_work);
+			flush_workqueue(mdata->event_wq);
+			queue_work(mdata->event_wq, &mdata->suspend_work);
 		}
 	} else if (event == MI_DRM_EVENT_BLANK) {
 		if (blank == MI_DRM_BLANK_UNBLANK) {
 			MI_KB_ERR("keyboard resume");
 			mdata->is_in_suspend = false;
 			flush_workqueue(mdata->event_wq);
-			queue_work(mdata->event_wq,
-				   &mdata->resume_work);
+			queue_work(mdata->event_wq, &mdata->resume_work);
 		}
 	}
 
@@ -484,15 +377,12 @@ static void kb_power_supply_work(struct work_struct *work)
 {
 	struct xiaomi_keyboard_data *mdata = container_of(
 		work, struct xiaomi_keyboard_data, power_supply_work);
-	int is_usb_exist = 0;
+	bool is_usb_exist = !!power_supply_is_system_supplied();
 
-	mutex_lock(&mdata->power_supply_lock);
-	is_usb_exist = !!power_supply_is_system_supplied();
 	if (is_usb_exist != mdata->is_usb_exist) {
 		mdata->is_usb_exist = is_usb_exist;
 		MI_KB_INFO("power supply is: %d", mdata->is_usb_exist);
 	}
-	mutex_unlock(&mdata->power_supply_lock);
 }
 
 static void set_keyboard_status(bool on)
@@ -541,7 +431,6 @@ static void set_keyboard_status(bool on)
 		ret = xiaomi_keyboard_resetup_gpio(mdata->pdata);
 		if (ret < 0) {
 			MI_KB_ERR("resetup gpio failed\n");
-			return;
 		}
 		xiaomi_keyboard_power_off();
 		mdata->keyboard_is_enable = false;
@@ -561,7 +450,6 @@ static int xiaomi_keyboard_probe(struct platform_device *pdev)
 {
 	struct xiaomi_keyboard_platdata *pdata;
 	int ret = 0;
-	MI_KB_INFO("enter\n");
 	mdata = kzalloc(sizeof(struct xiaomi_keyboard_data), GFP_KERNEL);
 	if (!mdata) {
 		MI_KB_ERR("Alloc Memory for xiaomi_keyboard_data failed\n");
@@ -573,45 +461,42 @@ static int xiaomi_keyboard_probe(struct platform_device *pdev)
 			     GFP_KERNEL);
 	if (!pdata) {
 		MI_KB_ERR("Alloc Memory for xiaomi_keyboard_platdata failed\n");
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto err_free_mdata;
 	}
 
 	mdata->pdev = pdev;
 	mdata->pdata = pdata;
-	mutex_init(&mdata->rw_mutex);
-	mutex_init(&mdata->power_supply_lock);
-	mdata->is_usb_exist = 0;
 
 	ret = xiaomi_keyboard_parse_dt(&pdev->dev);
 	if (ret) {
 		MI_KB_ERR("parse device tree failed\n");
-		goto out;
+		goto err_free_mdata;
 	}
 
 	ret = xiaomi_keyboard_pinctrl_init(&pdev->dev);
 	if (ret) {
 		MI_KB_ERR("Pinctrl init failed\n");
-		goto out;
+		goto err_free_mdata;
 	}
 
 	pdata = mdata->pdata;
 	ret = xiaomi_keyboard_gpio_config(pdata);
 	if (ret) {
 		MI_KB_ERR("set gpio config failed\n");
-		goto out;
+		goto err_pinctrl_put;
 	}
 
 	mdata->dev_pm_suspend = false;
 	mdata->keyboard_is_enable = false;
 	mdata->is_in_suspend = false;
-	mdata->connected = true;
-	mdata->user_enabled = true;
+	mdata->is_usb_exist = false;
 
 	ret = sysfs_create_group(&mdata->pdev->dev.kobj,
 				 &xiaomi_attribute_group);
 	if (ret < 0) {
 		MI_KB_ERR("Create sysfs group Failed\n");
-		goto err_pinctrl_select;
+		goto err_gpio_deconfig;
 	}
 
 	mdata->event_wq =
@@ -620,7 +505,7 @@ static int xiaomi_keyboard_probe(struct platform_device *pdev)
 	if (!mdata->event_wq) {
 		MI_KB_ERR("Can not create work thread for suspend/resume!!");
 		ret = -ENOMEM;
-		goto err_alloc_work_thread_failed;
+		goto err_sysfs_remove;
 	}
 	INIT_WORK(&mdata->resume_work, keyboard_resume_work);
 	INIT_WORK(&mdata->suspend_work, keyboard_suspend_work);
@@ -630,7 +515,7 @@ static int xiaomi_keyboard_probe(struct platform_device *pdev)
 	ret = mi_drm_register_client(&mdata->drm_notif);
 	if (ret) {
 		MI_KB_ERR("register drm_notifier failed. ret=%d\n", ret);
-		goto err_register_drm_notif_failed;
+		goto err_drm_unregister;
 	}
 
 	mdata->power_supply_notifier.notifier_call = kb_power_supply_event;
@@ -638,55 +523,41 @@ static int xiaomi_keyboard_probe(struct platform_device *pdev)
 	if (ret) {
 		MI_KB_ERR("register power_supply_notifier failed. ret=%d\n",
 			  ret);
-		goto err_register_power_supply_notif_failed;
+		goto err_power_supply_unreg;
 	}
 
-	MI_KB_INFO("Success\n");
 	return ret;
 
-err_register_power_supply_notif_failed:
-err_register_drm_notif_failed:
+err_power_supply_unreg:
 	if (mi_drm_unregister_client(&mdata->drm_notif))
 		MI_KB_ERR("Error occurred while unregistering drm_notifier\n");
-	if (mdata->event_wq) {
+err_drm_unregister:
+	if (mdata->event_wq)
 		destroy_workqueue(mdata->event_wq);
-	}
-err_alloc_work_thread_failed:
-	sysfs_remove_file(&mdata->pdev->dev.kobj,
-			  &dev_attr_xiaomi_keyboard_conn_status.attr);
-err_pinctrl_select:
-	if (mdata->pinctrl) {
-		devm_pinctrl_put(mdata->pinctrl);
-	}
+err_sysfs_remove:
+	sysfs_remove_group(&mdata->pdev->dev.kobj, &xiaomi_attribute_group);
+err_gpio_deconfig:
 	xiaomi_keyboard_gpio_deconfig(pdata);
-out:
-	mutex_destroy(&mdata->rw_mutex);
-	mutex_destroy(&mdata->power_supply_lock);
-	if (mdata) {
-		kfree(mdata);
-		mdata = NULL;
-	}
+err_pinctrl_put:
+	devm_pinctrl_put(mdata->pinctrl);
+err_free_mdata:
+	kfree(mdata);
+	mdata = NULL;
 	MI_KB_ERR("Failed\n");
 	return ret;
 }
 
 static void xiaomi_keyboard_remove(struct platform_device *pdev)
 {
-	MI_KB_INFO("enter\n");
+	power_supply_unreg_notifier(&mdata->power_supply_notifier);
 	mi_drm_unregister_client(&mdata->drm_notif);
 	destroy_workqueue(mdata->event_wq);
+	sysfs_remove_group(&mdata->pdev->dev.kobj, &xiaomi_attribute_group);
 	xiaomi_keyboard_gpio_deconfig(mdata->pdata);
-	sysfs_remove_file(&mdata->pdev->dev.kobj,
-			  &dev_attr_xiaomi_keyboard_conn_status.attr);
 	xiaomi_keyboard_power_off();
 	devm_pinctrl_put(mdata->pinctrl);
-	xiaomi_keyboard_gpio_deconfig(mdata->pdata);
-	mutex_destroy(&mdata->rw_mutex);
-	mutex_destroy(&mdata->power_supply_lock);
-	if (mdata) {
-		kfree(mdata);
-		mdata = NULL;
-	}
+	kfree(mdata);
+	mdata = NULL;
 }
 
 #ifdef CONFIG_OF
@@ -702,7 +573,7 @@ static const struct platform_device_id xiaomi_keyboard_driver_ids[] = {
 		.name = "xiaomi-keyboard",
 		.driver_data = 0,
 	},
-	{ }
+	{}
 };
 MODULE_DEVICE_TABLE(platform, xiaomi_keyboard_driver_ids);
 
