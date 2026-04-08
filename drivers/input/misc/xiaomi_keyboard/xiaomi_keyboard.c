@@ -12,8 +12,10 @@
 #include <linux/of.h>
 #include <linux/slab.h>
 #include <linux/device.h>
+#include <linux/workqueue.h>
 #include "xiaomi_keyboard.h"
 #include <drm/drm_notifier.h>
+#include <linux/gpio_keys.h>
 #include <linux/notifier.h>
 #include <linux/input/usbkbd-xiaomi.h>
 
@@ -366,23 +368,39 @@ static int kb_power_supply_event(struct notifier_block *nb, unsigned long event,
 {
 	struct xiaomi_keyboard_data *mdata = container_of(
 		nb, struct xiaomi_keyboard_data, power_supply_notifier);
-
-	if (mdata != NULL)
-		queue_work(mdata->event_wq, &mdata->power_supply_work);
-
-	return 0;
-}
-
-static void kb_power_supply_work(struct work_struct *work)
-{
-	struct xiaomi_keyboard_data *mdata = container_of(
-		work, struct xiaomi_keyboard_data, power_supply_work);
 	bool is_usb_exist = !!power_supply_is_system_supplied();
 
 	if (is_usb_exist != mdata->is_usb_exist) {
 		mdata->is_usb_exist = is_usb_exist;
 		MI_KB_INFO("power supply is: %d", mdata->is_usb_exist);
 	}
+
+	return NOTIFY_OK;
+}
+
+static void xiaomi_keyboard_lid_work(struct work_struct *work)
+{
+	struct xiaomi_keyboard_data *mdata =
+		container_of(work, struct xiaomi_keyboard_data, lid_work.work);
+
+	set_keyboard_status(mdata->lid_is_closed ? false : true);
+}
+
+static int xiaomi_keyboard_lid_notifier_callback(struct notifier_block *self,
+						 unsigned long code,
+						 void *state)
+{
+	struct xiaomi_keyboard_data *mdata =
+		container_of(self, struct xiaomi_keyboard_data, lid_notif);
+	bool lid_is_closed = *(int *)state;
+
+	if (lid_is_closed != mdata->lid_is_closed) {
+		MI_KB_INFO("lid state: %s\n", lid_is_closed ? "closed" : "open");
+		mdata->lid_is_closed = lid_is_closed;
+		schedule_delayed_work(&mdata->lid_work, msecs_to_jiffies(1000));
+	}
+
+	return NOTIFY_OK;
 }
 
 static void set_keyboard_status(bool on)
@@ -491,6 +509,7 @@ static int xiaomi_keyboard_probe(struct platform_device *pdev)
 	mdata->keyboard_is_enable = false;
 	mdata->is_in_suspend = false;
 	mdata->is_usb_exist = false;
+	mdata->lid_is_closed = false;
 
 	ret = sysfs_create_group(&mdata->pdev->dev.kobj,
 				 &xiaomi_attribute_group);
@@ -509,7 +528,7 @@ static int xiaomi_keyboard_probe(struct platform_device *pdev)
 	}
 	INIT_WORK(&mdata->resume_work, keyboard_resume_work);
 	INIT_WORK(&mdata->suspend_work, keyboard_suspend_work);
-	INIT_WORK(&mdata->power_supply_work, kb_power_supply_work);
+	INIT_DELAYED_WORK(&mdata->lid_work, xiaomi_keyboard_lid_work);
 
 	mdata->drm_notif.notifier_call = keyboard_drm_notifier_callback;
 	ret = mi_drm_register_client(&mdata->drm_notif);
@@ -526,8 +545,17 @@ static int xiaomi_keyboard_probe(struct platform_device *pdev)
 		goto err_power_supply_unreg;
 	}
 
+	mdata->lid_notif.notifier_call = xiaomi_keyboard_lid_notifier_callback;
+	ret = gpio_keys_lid_notifier_register(&mdata->lid_notif);
+	if (ret) {
+		MI_KB_ERR("register lid_notifier failed. ret=%d\n", ret);
+		goto err_lid_notif_unreg;
+	}
+
 	return ret;
 
+err_lid_notif_unreg:
+	power_supply_unreg_notifier(&mdata->power_supply_notifier);
 err_power_supply_unreg:
 	if (mi_drm_unregister_client(&mdata->drm_notif))
 		MI_KB_ERR("Error occurred while unregistering drm_notifier\n");
@@ -549,6 +577,8 @@ err_free_mdata:
 
 static void xiaomi_keyboard_remove(struct platform_device *pdev)
 {
+	cancel_delayed_work_sync(&mdata->lid_work);
+	gpio_keys_lid_notifier_unregister(&mdata->lid_notif);
 	power_supply_unreg_notifier(&mdata->power_supply_notifier);
 	mi_drm_unregister_client(&mdata->drm_notif);
 	destroy_workqueue(mdata->event_wq);
