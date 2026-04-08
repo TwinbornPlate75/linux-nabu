@@ -209,6 +209,7 @@
 			linux,code = <SW_LID>;
 			debounce-interval = <15>;
 			linux,can-disable;
+			linux,notify-chain;
 			wakeup-source;
 		};
 	};
