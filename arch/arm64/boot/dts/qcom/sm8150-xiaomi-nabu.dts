@@ -924,7 +924,7 @@
 			 * pulling RX low (by sending wakeup bytes).
 			 */
 			 pins = "gpio44";
-			 bias-pull-down;
+			 bias-pull-up;
 		};
 
 		pinconf-tx {
