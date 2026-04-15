@@ -42,7 +42,7 @@ static ssize_t xiaomi_keyboard_enabled_show(struct device *dev,
 	if (!mdata)
 		return -EINVAL;
 
-	return scnprintf(buf, PAGE_SIZE, "%d", mdata->keyboard_is_enable);
+	return scnprintf(buf, PAGE_SIZE, "%d", mdata->keyboard_switch);
 }
 
 static ssize_t xiaomi_keyboard_enabled_store(struct device *dev,
@@ -57,6 +57,7 @@ static ssize_t xiaomi_keyboard_enabled_store(struct device *dev,
 	switch (value) {
 	case 0:
 	case 1:
+		mdata->keyboard_switch = value;
 		set_keyboard_status(value);
 		break;
 	default:
@@ -394,8 +395,12 @@ static int xiaomi_keyboard_lid_notifier_callback(struct notifier_block *self,
 		container_of(self, struct xiaomi_keyboard_data, lid_notif);
 	bool lid_is_closed = *(int *)state;
 
+	if (!mdata->keyboard_switch)
+		return NOTIFY_OK;
+
 	if (lid_is_closed != mdata->lid_is_closed) {
-		MI_KB_INFO("lid state: %s\n", lid_is_closed ? "closed" : "open");
+		MI_KB_INFO("lid state: %s\n",
+			   lid_is_closed ? "closed" : "open");
 		mdata->lid_is_closed = lid_is_closed;
 		schedule_delayed_work(&mdata->lid_work, msecs_to_jiffies(1000));
 	}
@@ -510,6 +515,7 @@ static int xiaomi_keyboard_probe(struct platform_device *pdev)
 	mdata->is_in_suspend = false;
 	mdata->is_usb_exist = false;
 	mdata->lid_is_closed = false;
+	mdata->keyboard_switch = false;
 
 	ret = sysfs_create_group(&mdata->pdev->dev.kobj,
 				 &xiaomi_attribute_group);

@@ -42,5 +42,6 @@ struct xiaomi_keyboard_data {
 	bool lid_is_closed;
 	bool keyboard_is_enable;
 	bool is_in_suspend;
+	bool keyboard_switch;
 };
 #endif
