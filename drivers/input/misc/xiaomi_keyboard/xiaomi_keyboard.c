@@ -402,7 +402,7 @@ static int xiaomi_keyboard_lid_notifier_callback(struct notifier_block *self,
 		MI_KB_INFO("lid state: %s\n",
 			   lid_is_closed ? "closed" : "open");
 		mdata->lid_is_closed = lid_is_closed;
-		schedule_delayed_work(&mdata->lid_work, msecs_to_jiffies(1000));
+		schedule_delayed_work(&mdata->lid_work, msecs_to_jiffies(500));
 	}
 
 	return NOTIFY_OK;
