@@ -328,8 +328,8 @@ static int keyboard_drm_notifier_callback(struct notifier_block *self,
 	struct xiaomi_keyboard_data *mdata =
 		container_of(self, struct xiaomi_keyboard_data, drm_notif);
 
-	if (!data || !mdata)
-		return 0;
+	if (!data || !mdata || !mdata->keyboard_switch)
+		return NOTIFY_OK;
 
 	if (event == MI_DRM_EARLY_EVENT_BLANK) {
 		if (blank == MI_DRM_BLANK_POWERDOWN) {
@@ -347,7 +347,7 @@ static int keyboard_drm_notifier_callback(struct notifier_block *self,
 		}
 	}
 
-	return 0;
+	return NOTIFY_OK;
 }
 
 static void keyboard_resume_work(struct work_struct *work)
