@@ -2,7 +2,8 @@
 #include <linux/err.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
-#include <linux/gpio.h>
+#include <linux/gpio/machine.h>
+#include <linux/gpio/consumer.h>
 #include <linux/of_gpio.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
@@ -25,14 +26,23 @@ static void set_keyboard_status(bool on);
 
 static void xiaomi_keyboard_reset(void)
 {
+	struct gpio_desc *rst_desc;
+
 	if (!mdata || !mdata->pdata) {
 		MI_KB_ERR("reset failed!Invalid Memory\n");
 		return;
 	}
+
+	rst_desc = gpio_to_desc(mdata->pdata->rst_gpio);
+	if (IS_ERR(rst_desc)) {
+		MI_KB_ERR("failed to get rst gpio desc\n");
+		return;
+	}
+
 	MI_KB_INFO("xiaomi keyboard IC Reset\n");
-	gpio_direction_output(mdata->pdata->rst_gpio, 0);
+	gpiod_direction_output(rst_desc, 0);
 	msleep(2);
-	gpio_direction_output(mdata->pdata->rst_gpio, 1);
+	gpiod_direction_output(rst_desc, 1);
 }
 
 static ssize_t xiaomi_keyboard_enabled_show(struct device *dev,
@@ -86,57 +96,68 @@ static irqreturn_t xiaomi_keyboard_irq_func(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-static int xiaomi_keyboard_gpio_config(struct xiaomi_keyboard_platdata *pdata)
+static int xiaomi_keyboard_gpio_config(struct xiaomi_keyboard_platdata *pdata,
+					struct device *dev)
 {
 	int ret = 0;
-	if (gpio_is_valid(pdata->rst_gpio)) {
-		ret = gpio_request_one(pdata->rst_gpio, GPIOF_OUT_INIT_LOW,
-				       "kb_rst");
-		if (ret) {
-			MI_KB_ERR(
-				"Failed to request xiaomi keyboard rst gpio\n");
-			goto err_request_rst_gpio;
-		}
+	struct gpio_desc *rst_desc, *irq_desc;
+
+	rst_desc = gpio_to_desc(pdata->rst_gpio);
+	if (IS_ERR(rst_desc)) {
+		MI_KB_ERR("failed to get rst gpio desc\n");
+		return PTR_ERR(rst_desc);
 	}
 
-	if (gpio_is_valid(pdata->in_irq_gpio)) {
-		ret = gpio_request_one(pdata->in_irq_gpio, GPIOF_IN,
-				       "kb_in_irq");
-		if (ret) {
-			MI_KB_ERR(
-				"Failed to request xiaomi keyboard in-irq gpio\n");
-			goto err_request_in_irq_gpio;
-		}
+	ret = gpiod_direction_output(rst_desc, 0);
+	if (ret) {
+		MI_KB_ERR("Failed to set rst gpio direction\n");
+		return ret;
+	}
+
+	irq_desc = gpio_to_desc(pdata->in_irq_gpio);
+	if (IS_ERR(irq_desc)) {
+		MI_KB_ERR("failed to get irq gpio desc\n");
+		return PTR_ERR(irq_desc);
+	}
+
+	ret = gpiod_direction_input(irq_desc);
+	if (ret) {
+		MI_KB_ERR("Failed to set irq gpio direction\n");
+		return ret;
 	}
 
 	return ret;
-err_request_in_irq_gpio:
-	gpio_free(pdata->rst_gpio);
-err_request_rst_gpio:
-	return ret;
-}
-
-static void
-xiaomi_keyboard_gpio_deconfig(struct xiaomi_keyboard_platdata *pdata)
-{
-	if (gpio_is_valid(pdata->rst_gpio))
-		gpio_free(pdata->rst_gpio);
-
-	if (gpio_is_valid(pdata->in_irq_gpio))
-		gpio_free(pdata->in_irq_gpio);
 }
 
 static int xiaomi_keyboard_setup_gpio(struct xiaomi_keyboard_platdata *pdata)
 {
 	int ret = 0;
+	struct gpio_desc *rst_desc, *irq_desc;
+
 	if (!pdata) {
 		MI_KB_ERR("xiaomi keyboard platdata is NULL\n");
 		return -EINVAL;
 	}
-	if (gpio_is_valid(pdata->rst_gpio))
-		gpio_direction_output(pdata->rst_gpio, 1);
 
-	mdata->irq = gpio_to_irq(pdata->in_irq_gpio);
+	rst_desc = gpio_to_desc(pdata->rst_gpio);
+	if (IS_ERR(rst_desc)) {
+		MI_KB_ERR("failed to get rst gpio desc\n");
+		return PTR_ERR(rst_desc);
+	}
+
+	ret = gpiod_direction_output(rst_desc, 1);
+	if (ret) {
+		MI_KB_ERR("Failed to set rst gpio direction\n");
+		return ret;
+	}
+
+	irq_desc = gpio_to_desc(pdata->in_irq_gpio);
+	if (IS_ERR(irq_desc)) {
+		MI_KB_ERR("failed to get irq gpio desc\n");
+		return PTR_ERR(irq_desc);
+	}
+
+	mdata->irq = gpiod_to_irq(irq_desc);
 	if (mdata->irq > 0) {
 		ret = request_threaded_irq(mdata->irq, NULL,
 					   xiaomi_keyboard_irq_func,
@@ -154,18 +175,23 @@ static int xiaomi_keyboard_setup_gpio(struct xiaomi_keyboard_platdata *pdata)
 static int xiaomi_keyboard_resetup_gpio(struct xiaomi_keyboard_platdata *pdata)
 {
 	int ret = 0;
+	struct gpio_desc *rst_desc;
 
 	if (!mdata || !pdata) {
 		MI_KB_ERR("mdata or pdata not ready, return!");
 		return -EINVAL;
 	}
 
-	if (gpio_is_valid(pdata->rst_gpio)) {
-		ret = gpio_direction_output(pdata->rst_gpio, 0);
-		if (ret) {
-			MI_KB_ERR("Failed to set rst_gpio to output low\n");
-			return ret;
-		}
+	rst_desc = gpio_to_desc(pdata->rst_gpio);
+	if (IS_ERR(rst_desc)) {
+		MI_KB_ERR("failed to get rst gpio desc\n");
+		return PTR_ERR(rst_desc);
+	}
+
+	ret = gpiod_direction_output(rst_desc, 0);
+	if (ret) {
+		MI_KB_ERR("Failed to set rst_gpio to output low\n");
+		return ret;
 	}
 
 	free_irq(mdata->irq, mdata);
@@ -178,21 +204,32 @@ static int xiaomi_keyboard_parse_dt(struct device *dev)
 {
 	struct device_node *np = dev->of_node;
 	struct xiaomi_keyboard_platdata *pdata;
-	int ret = 0;
 
 	pdata = mdata->pdata;
 
 	pdata->rst_gpio = of_get_named_gpio(np, "xiaomi-keyboard,rst-gpio", 0);
+	if (pdata->rst_gpio < 0) {
+		MI_KB_ERR("failed to get rst gpio: %d\n", pdata->rst_gpio);
+		return pdata->rst_gpio;
+	}
 	MI_KB_INFO("xiaomi-kb,reset-gpio=%d\n", pdata->rst_gpio);
 
 	pdata->in_irq_gpio =
 		of_get_named_gpio(np, "xiaomi-keyboard,in-irq-gpio", 0);
+	if (pdata->in_irq_gpio < 0) {
+		MI_KB_ERR("failed to get in-irq gpio: %d\n", pdata->in_irq_gpio);
+		return pdata->in_irq_gpio;
+	}
 	MI_KB_INFO("xiaomi-kb,in-irq-gpio=%d\n", pdata->in_irq_gpio);
 
 	pdata->vdd_gpio = of_get_named_gpio(np, "xiaomi-keyboard,vdd-gpio", 0);
+	if (pdata->vdd_gpio < 0) {
+		MI_KB_ERR("failed to get vdd gpio: %d\n", pdata->vdd_gpio);
+		return pdata->vdd_gpio;
+	}
 	MI_KB_INFO("xiaomi-kb,vdd-gpio=%d\n", pdata->vdd_gpio);
 
-	return ret;
+	return 0;
 }
 #else
 static int xiaomi_keyboard_parse_dt(struct device *dev)
@@ -240,17 +277,22 @@ err_pinctrl_get:
 static int xiaomi_keyboard_power_on(void)
 {
 	int ret = 0;
+	struct gpio_desc *vdd_desc;
 	struct xiaomi_keyboard_platdata *pdata;
+
 	pdata = mdata->pdata;
 	MI_KB_INFO("Power On\n");
-	if (gpio_is_valid(pdata->vdd_gpio)) {
-		ret = gpio_request_one(pdata->vdd_gpio, GPIOF_OUT_INIT_HIGH,
-				       "kb_vdd_gpio");
-		if (ret) {
-			MI_KB_ERR(
-				"Failed to request xiaomi-keyboard-out-irq gpio\n");
-			return ret;
-		}
+
+	vdd_desc = gpio_to_desc(pdata->vdd_gpio);
+	if (IS_ERR(vdd_desc)) {
+		MI_KB_ERR("failed to get vdd gpio desc\n");
+		return PTR_ERR(vdd_desc);
+	}
+
+	ret = gpiod_direction_output(vdd_desc, 1);
+	if (ret) {
+		MI_KB_ERR("Failed to set vdd gpio direction\n");
+		return ret;
 	}
 
 	return ret;
@@ -258,14 +300,19 @@ static int xiaomi_keyboard_power_on(void)
 
 static void xiaomi_keyboard_power_off(void)
 {
+	struct gpio_desc *vdd_desc;
 	struct xiaomi_keyboard_platdata *pdata;
+
 	pdata = mdata->pdata;
 	MI_KB_INFO("Power Off\n");
-	if (gpio_is_valid(pdata->vdd_gpio)) {
-		gpio_direction_output(pdata->vdd_gpio, 0);
-		gpio_free(pdata->vdd_gpio);
+
+	vdd_desc = gpio_to_desc(pdata->vdd_gpio);
+	if (IS_ERR(vdd_desc)) {
+		MI_KB_ERR("failed to get vdd gpio desc\n");
+		return;
 	}
-	return;
+
+	gpiod_direction_output(vdd_desc, 0);
 }
 
 static int xiaomi_keyboard_suspend(struct device *dev)
@@ -504,7 +551,7 @@ static int xiaomi_keyboard_probe(struct platform_device *pdev)
 	}
 
 	pdata = mdata->pdata;
-	ret = xiaomi_keyboard_gpio_config(pdata);
+	ret = xiaomi_keyboard_gpio_config(pdata, &pdev->dev);
 	if (ret) {
 		MI_KB_ERR("set gpio config failed\n");
 		goto err_pinctrl_put;
@@ -521,7 +568,7 @@ static int xiaomi_keyboard_probe(struct platform_device *pdev)
 				 &xiaomi_attribute_group);
 	if (ret < 0) {
 		MI_KB_ERR("Create sysfs group Failed\n");
-		goto err_gpio_deconfig;
+		goto err_pinctrl_put;
 	}
 
 	mdata->event_wq =
@@ -570,8 +617,6 @@ err_drm_unregister:
 		destroy_workqueue(mdata->event_wq);
 err_sysfs_remove:
 	sysfs_remove_group(&mdata->pdev->dev.kobj, &xiaomi_attribute_group);
-err_gpio_deconfig:
-	xiaomi_keyboard_gpio_deconfig(pdata);
 err_pinctrl_put:
 	devm_pinctrl_put(mdata->pinctrl);
 err_free_mdata:
@@ -589,7 +634,6 @@ static void xiaomi_keyboard_remove(struct platform_device *pdev)
 	mi_drm_unregister_client(&mdata->drm_notif);
 	destroy_workqueue(mdata->event_wq);
 	sysfs_remove_group(&mdata->pdev->dev.kobj, &xiaomi_attribute_group);
-	xiaomi_keyboard_gpio_deconfig(mdata->pdata);
 	xiaomi_keyboard_power_off();
 	devm_pinctrl_put(mdata->pinctrl);
 	kfree(mdata);
