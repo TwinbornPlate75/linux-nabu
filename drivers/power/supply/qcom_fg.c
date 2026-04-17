@@ -888,6 +888,7 @@ static enum power_supply_property qcom_fg_props[] = {
 	POWER_SUPPLY_PROP_TEMP_MAX,
 	POWER_SUPPLY_PROP_TEMP_ALERT_MIN,
 	POWER_SUPPLY_PROP_TEMP_ALERT_MAX,
+	POWER_SUPPLY_PROP_SCOPE,
 };
 
 static int qcom_fg_get_property(struct power_supply *psy,
@@ -967,6 +968,9 @@ static int qcom_fg_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_TEMP_ALERT_MIN:
 	case POWER_SUPPLY_PROP_TEMP_ALERT_MAX:
 		ret = chip->ops->get_temp_threshold(chip, psp, &val->intval);
+		break;
+	case POWER_SUPPLY_PROP_SCOPE:
+		val->intval = POWER_SUPPLY_SCOPE_SYSTEM;
 		break;
 	default:
 		dev_err(chip->dev, "invalid property: %d\n", psp);
