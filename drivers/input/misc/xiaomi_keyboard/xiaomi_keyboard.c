@@ -319,10 +319,8 @@ static int xiaomi_keyboard_suspend(struct device *dev)
 {
 	int ret = 0;
 	if (mdata->pinctrl && mdata->pins_suspend) {
-		ret = (mdata->keyboard_is_enable && mdata->is_usb_exist) ?
-			      0 :
-			      pinctrl_select_state(mdata->pinctrl,
-						   mdata->pins_suspend);
+		mdata->is_in_suspend = true;
+		ret = pinctrl_select_state(mdata->pinctrl, mdata->pins_suspend);
 		if (ret < 0) {
 			MI_KB_ERR("Set suspend pin state error:%d\n", ret);
 		}
@@ -333,12 +331,8 @@ static int xiaomi_keyboard_suspend(struct device *dev)
 static int xiaomi_keyboard_resume(struct device *dev)
 {
 	int ret = 0;
-	if (!mdata->keyboard_is_enable) {
-		MI_KB_INFO("keyboard_is_enable is false, stop resume.\n");
-		MI_KB_INFO("exit\n");
-		return -1;
-	}
 	if (mdata->pinctrl && mdata->pins_active) {
+		mdata->is_in_suspend = false;
 		ret = pinctrl_select_state(mdata->pinctrl, mdata->pins_active);
 		if (ret < 0) {
 			MI_KB_ERR("Set active pin state error:%d\n", ret);
@@ -371,24 +365,32 @@ static const struct dev_pm_ops xiaomi_keyboard_pm_ops = {
 static int keyboard_drm_notifier_callback(struct notifier_block *self,
 					  unsigned long event, void *data)
 {
-	int blank = *(int *)data;
 	struct xiaomi_keyboard_data *mdata =
 		container_of(self, struct xiaomi_keyboard_data, drm_notif);
+	int blank = *(int *)data;
 
 	if (!data || !mdata || !mdata->keyboard_switch)
 		return NOTIFY_OK;
 
 	if (event == MI_DRM_EARLY_EVENT_BLANK) {
 		if (blank == MI_DRM_BLANK_POWERDOWN) {
+			if (!mdata->keyboard_is_enable)
+				return NOTIFY_OK;
+			if (mdata->is_usb_exist)
+				return NOTIFY_OK;
 			MI_KB_ERR("keyboard suspend");
-			mdata->is_in_suspend = true;
 			flush_workqueue(mdata->event_wq);
 			queue_work(mdata->event_wq, &mdata->suspend_work);
 		}
 	} else if (event == MI_DRM_EVENT_BLANK) {
 		if (blank == MI_DRM_BLANK_UNBLANK) {
+			if (!mdata->keyboard_is_enable)
+				return NOTIFY_OK;
+			if (!mdata->is_in_suspend) {
+				xiaomi_keyboard_reset();
+				return NOTIFY_OK;
+			}
 			MI_KB_ERR("keyboard resume");
-			mdata->is_in_suspend = false;
 			flush_workqueue(mdata->event_wq);
 			queue_work(mdata->event_wq, &mdata->resume_work);
 		}
@@ -449,7 +451,10 @@ static int xiaomi_keyboard_lid_notifier_callback(struct notifier_block *self,
 		MI_KB_INFO("lid state: %s\n",
 			   lid_is_closed ? "closed" : "open");
 		mdata->lid_is_closed = lid_is_closed;
-		schedule_delayed_work(&mdata->lid_work, msecs_to_jiffies(500));
+		if (mdata->is_usb_exist)
+			return NOTIFY_OK;
+		schedule_delayed_work(&mdata->lid_work, 
+			lid_is_closed ? 0 : msecs_to_jiffies(500));
 	}
 
 	return NOTIFY_OK;
