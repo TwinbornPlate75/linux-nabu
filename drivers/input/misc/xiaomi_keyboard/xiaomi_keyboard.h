@@ -6,7 +6,6 @@
 #include <linux/of.h>
 #include <linux/uaccess.h>
 #include <linux/platform_device.h>
-#include <linux/power_supply.h>
 
 #define XIAOMI_KB_TAG "xiaomi-keyboard"
 #define MI_KB_INFO(fmt, args...) \
@@ -29,7 +28,6 @@ struct xiaomi_keyboard_data {
 	struct pinctrl_state *pins_suspend;
 	struct notifier_block lid_notif;
 	struct notifier_block drm_notif;
-	struct notifier_block power_supply_notifier;
 	struct workqueue_struct *event_wq;
 	struct work_struct resume_work;
 	struct work_struct suspend_work;
@@ -38,7 +36,6 @@ struct xiaomi_keyboard_data {
 
 	int irq;
 	bool dev_pm_suspend;
-	bool is_usb_exist;
 	bool lid_is_closed;
 	bool keyboard_is_enable;
 	bool is_in_suspend;
