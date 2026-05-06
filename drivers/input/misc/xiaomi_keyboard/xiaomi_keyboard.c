@@ -374,18 +374,28 @@ static int keyboard_drm_notifier_callback(struct notifier_block *self,
 
 	if (event == MI_DRM_EARLY_EVENT_BLANK) {
 		if (blank == MI_DRM_BLANK_POWERDOWN) {
+			flush_workqueue(mdata->event_wq);
+			if (mdata->lid_updated) {
+				queue_work(mdata->event_wq, &mdata->lid_work);
+				mdata->lid_updated = false;
+				return NOTIFY_OK;
+			}
 			if (!mdata->keyboard_is_enable)
 				return NOTIFY_OK;
 			MI_KB_ERR("keyboard suspend");
-			flush_workqueue(mdata->event_wq);
 			queue_work(mdata->event_wq, &mdata->suspend_work);
 		}
 	} else if (event == MI_DRM_EVENT_BLANK) {
 		if (blank == MI_DRM_BLANK_UNBLANK) {
+			flush_workqueue(mdata->event_wq);
+			if (mdata->lid_updated) {
+				queue_work(mdata->event_wq, &mdata->lid_work);
+				mdata->lid_updated = false;
+				return NOTIFY_OK;
+			}
 			if (!mdata->keyboard_is_enable)
 				return NOTIFY_OK;
 			MI_KB_ERR("keyboard resume");
-			flush_workqueue(mdata->event_wq);
 			queue_work(mdata->event_wq, &mdata->resume_work);
 		}
 	}
@@ -410,8 +420,7 @@ static void keyboard_suspend_work(struct work_struct *work)
 static void xiaomi_keyboard_lid_work(struct work_struct *work)
 {
 	struct xiaomi_keyboard_data *mdata =
-		container_of(work, struct xiaomi_keyboard_data, lid_work.work);
-
+		container_of(work, struct xiaomi_keyboard_data, lid_work);
 	set_keyboard_status(mdata->lid_is_closed ? false : true);
 }
 
@@ -430,8 +439,7 @@ static int xiaomi_keyboard_lid_notifier_callback(struct notifier_block *self,
 		MI_KB_INFO("lid state: %s\n",
 			   lid_is_closed ? "closed" : "open");
 		mdata->lid_is_closed = lid_is_closed;
-		schedule_delayed_work(&mdata->lid_work, 
-			lid_is_closed ? 0 : msecs_to_jiffies(500));
+		mdata->lid_updated = true;
 	}
 
 	return NOTIFY_OK;
@@ -562,7 +570,7 @@ static int xiaomi_keyboard_probe(struct platform_device *pdev)
 	}
 	INIT_WORK(&mdata->resume_work, keyboard_resume_work);
 	INIT_WORK(&mdata->suspend_work, keyboard_suspend_work);
-	INIT_DELAYED_WORK(&mdata->lid_work, xiaomi_keyboard_lid_work);
+	INIT_WORK(&mdata->lid_work, xiaomi_keyboard_lid_work);
 
 	mdata->drm_notif.notifier_call = keyboard_drm_notifier_callback;
 	ret = mi_drm_register_client(&mdata->drm_notif);
@@ -599,7 +607,6 @@ err_free_mdata:
 
 static void xiaomi_keyboard_remove(struct platform_device *pdev)
 {
-	cancel_delayed_work_sync(&mdata->lid_work);
 	gpio_keys_lid_notifier_unregister(&mdata->lid_notif);
 	mi_drm_unregister_client(&mdata->drm_notif);
 	destroy_workqueue(mdata->event_wq);

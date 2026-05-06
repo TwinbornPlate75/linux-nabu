@@ -31,7 +31,7 @@ struct xiaomi_keyboard_data {
 	struct workqueue_struct *event_wq;
 	struct work_struct resume_work;
 	struct work_struct suspend_work;
-	struct delayed_work lid_work;
+	struct work_struct lid_work;
 	struct xiaomi_keyboard_platdata *pdata;
 
 	int irq;
@@ -40,5 +40,6 @@ struct xiaomi_keyboard_data {
 	bool keyboard_is_enable;
 	bool is_in_suspend;
 	bool keyboard_switch;
+	bool lid_updated;
 };
 #endif
