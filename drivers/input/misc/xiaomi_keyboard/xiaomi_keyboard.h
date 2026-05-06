@@ -28,7 +28,6 @@ struct xiaomi_keyboard_data {
 	struct pinctrl_state *pins_suspend;
 	struct notifier_block lid_notif;
 	struct notifier_block drm_notif;
-	struct workqueue_struct *event_wq;
 	struct work_struct resume_work;
 	struct work_struct suspend_work;
 	struct work_struct lid_work;
