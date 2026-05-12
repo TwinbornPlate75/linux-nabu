@@ -22,8 +22,6 @@
 
 #include "nt36xxx.h"
 
-#if BOOT_UPDATE_FIRMWARE
-
 #define SIZE_4KB 4096
 #define FLASH_SECTOR_SIZE SIZE_4KB
 #define FW_BIN_VER_OFFSET (fw_need_write_size - SIZE_4KB)
@@ -731,15 +729,7 @@ static int32_t nvt_download_firmware(void)
 		 * Send eng reset cmd before download FW
 		 * Keep TP_RESX low when send eng reset cmd
 		 */
-#if NVT_TOUCH_SUPPORT_HW_RST
-		gpio_set_value(ts->reset_gpio, 0);
-		mdelay(1);	//wait 1ms
-#endif
 		nvt_eng_reset();
-#if NVT_TOUCH_SUPPORT_HW_RST
-		gpio_set_value(ts->reset_gpio, 1);
-		mdelay(10);	//wait tRT2BRST after TP_RST
-#endif
 		nvt_bootloader_reset();
 
 		/* clear fw reset status */
@@ -835,7 +825,5 @@ download_fail:
 
 	update_firmware_release();
 request_firmware_fail:
-
 	return ret;
 }
-#endif /* BOOT_UPDATE_FIRMWARE */
