@@ -4,7 +4,6 @@
 
 #include <linux/module.h>
 #include <linux/kernel.h>
-#include <linux/sched.h>
 #include <linux/i2c.h>
 #include <linux/regmap.h>
 #include <linux/power_supply.h>
@@ -23,33 +22,17 @@
 #define REVERSE_FOD 500
 #define LIMIT_SOC 85
 
-#pragma pack(push, 1)
 struct idtp9418_event {
 	__u8 soc;
 	__u8 is_charging;
 	__u8 is_attached;
 	__u8 charge_limit;
 };
-#pragma pack(pop)
-
-struct idtp9418_device_info;
-
-struct idtp9418_access_func {
-	int (*read)(struct idtp9418_device_info *di, u16 reg, u8 *val);
-	int (*write)(struct idtp9418_device_info *di, u16 reg, u8 val);
-	int (*read_buf)(struct idtp9418_device_info *di, u16 reg, u8 *buf,
-			u32 size);
-	int (*write_buf)(struct idtp9418_device_info *di, u16 reg, u8 *buf,
-			 u32 size);
-	int (*mask_write)(struct idtp9418_device_info *di, u16 reg, u8 mask,
-			  u8 val);
-};
 
 struct idtp9418_device_info {
 	struct device *dev;
 	struct regmap *regmap;
 	struct power_supply *psy;
-	struct idtp9418_access_func bus;
 
 	struct alarm reverse_dping_alarm;
 	struct alarm reverse_chg_alarm;
@@ -74,6 +57,7 @@ struct idtp9418_device_info {
 
 	bool is_attached;
 	bool is_charging;
+	bool charge_monitor_first;
 	int reverse_pen_soc;
 	int charge_limit;
 	int hall3_irq;
@@ -170,84 +154,60 @@ static int idtp9418_read(struct idtp9418_device_info *di, u16 reg, u8 *val)
 
 static int idtp9418_write(struct idtp9418_device_info *di, u16 reg, u8 val)
 {
-	int rc = 0;
+	int rc;
 
 	usleep_range(1000, 2000);
 	rc = regmap_write(di->regmap, reg, val);
 	if (rc < 0)
-		dev_err(di->dev, "[idt] idtp9418 write error: %d\n", rc);
-	return rc;
-}
-
-static int idtp9418_masked_write(struct idtp9418_device_info *di, u16 reg,
-				 u8 mask, u8 val)
-{
-	int rc = 0;
-
-	rc = regmap_update_bits(di->regmap, reg, mask, val);
-	if (rc < 0)
-		dev_err(di->dev, "[idt] idtp9418 write mask error: %d\n", rc);
+		dev_err(di->dev, "idtp9418 write error: %d\n", rc);
 	return rc;
 }
 
 static int idtp9418_read_buffer(struct idtp9418_device_info *di, u16 reg,
 				u8 *buf, u32 size)
 {
-	int rc = 0;
+	int rc;
 
 	while (size--) {
-		rc = di->bus.read(di, reg++, buf++);
+		rc = idtp9418_read(di, reg++, buf++);
 		if (rc < 0) {
-			dev_err(di->dev, "[idt] read buf error: %d\n", rc);
+			dev_err(di->dev, "read buf error: %d\n", rc);
 			return rc;
 		}
 	}
-	return rc;
+	return 0;
 }
 
 static int idtp9418_write_buffer(struct idtp9418_device_info *di, u16 reg,
 				 u8 *buf, u32 size)
 {
-	int rc = 0;
+	int rc;
 
 	while (size--) {
-		rc = di->bus.write(di, reg++, *buf++);
+		rc = idtp9418_write(di, reg++, *buf++);
 		if (rc < 0) {
-			dev_err(di->dev, "[idt] write error: %d\n", rc);
+			dev_err(di->dev, "write buf error: %d\n", rc);
 			return rc;
 		}
 	}
-	return rc;
+	return 0;
 }
 
 static void reverse_clrInt(struct idtp9418_device_info *di, u8 *buf, u32 size)
 {
-	di->bus.write_buf(di, REG_SYS_INT_CLR, buf, size);
-	di->bus.write(di, REG_TX_CMD, TX_FOD_EN | TX_CLRINT);
-}
-
-static void idtp9418_set_reverse_gpio_state(struct idtp9418_device_info *di,
-					    int enable)
-{
-	gpiod_set_value(di->reverse_gpiod, !!enable);
-}
-
-static void
-idtp9418_set_reverse_boost_enable_gpio(struct idtp9418_device_info *di,
-				       int enable)
-{
-	gpiod_set_value(di->reverse_boost_en_gpiod, !!enable);
+	idtp9418_write_buffer(di, REG_SYS_INT_CLR, buf, size);
+	idtp9418_write(di, REG_TX_CMD, TX_FOD_EN | TX_CLRINT);
 }
 
 static void idtp9418_set_reverse_gpio(struct idtp9418_device_info *di,
 				      int enable)
 {
 	if (enable) {
-		idtp9418_set_reverse_gpio_state(di, enable);
-		idtp9418_set_reverse_boost_enable_gpio(di, enable);
+		gpiod_set_value(di->reverse_gpiod, true);
+		gpiod_set_value(di->reverse_boost_en_gpiod, true);
 	} else {
-		idtp9418_set_reverse_boost_enable_gpio(di, enable);
-		idtp9418_set_reverse_gpio_state(di, enable);
+		gpiod_set_value(di->reverse_boost_en_gpiod, false);
+		gpiod_set_value(di->reverse_gpiod, false);
 	}
 }
 
@@ -256,58 +216,51 @@ static void idt_set_reverse_fod(struct idtp9418_device_info *di, int mw)
 	u8 mw_l = mw & 0xff;
 	u8 mw_h = mw >> 8;
 
-	usleep_range(1000, 2000);
-	di->bus.write(di, REG_FOD_LOW, mw_l);
-	di->bus.write(di, REG_FOD_HIGH, mw_h);
-	dev_info(di->dev, "set reverse fod: %d\n", mw);
+	idtp9418_write(di, REG_FOD_LOW, mw_l);
+	idtp9418_write(di, REG_FOD_HIGH, mw_h);
 }
 
 static void idt_get_reverse_soc(struct idtp9418_device_info *di)
 {
 	u8 soc = 0;
 
-	di->bus.read(di, REG_CHG_STATUS, &soc);
-	if ((soc < 0) || (soc > 0x64)) {
+	idtp9418_read(di, REG_CHG_STATUS, &soc);
+	if (soc > 0x64) {
 		if (soc == 0xFF) {
-			dev_info(di->dev, "[reverse] soc is default 0xFF\n");
+			dev_info(di->dev, "soc is default 0xFF\n");
 			di->reverse_pen_soc = 0xFF;
 		} else {
-			dev_info(di->dev, "[reverse] soc illegal: %d\n", soc);
+			dev_err(di->dev, "soc illegal: %d\n", soc);
 			return;
 		}
 	}
-	dev_info(di->dev, "[reverse] soc is %d\n", soc);
 	di->reverse_pen_soc = soc;
 }
 
 static void idtp9418_reverse_charge_enable(struct idtp9418_device_info *di)
 {
-	u8 mode = 0;
+	u8 mode;
 
+	usleep_range(1000, 2000);
 	idt_set_reverse_fod(di, REVERSE_FOD);
 	for (int i = 0; i < 3; i++) {
-		di->bus.write(di, REG_TX_CMD, TX_EN | TX_FOD_EN);
-		di->bus.read(di, REG_TX_DATA, &mode);
-		dev_info(di->dev, "tx data(0078): 0x%x\n", mode);
+		idtp9418_write(di, REG_TX_CMD, TX_EN | TX_FOD_EN);
+		idtp9418_read(di, REG_TX_DATA, &mode);
 		if (mode & BIT(0)) {
-			dev_info(di->dev, "reverse charging start success\n");
 			di->is_charging = true;
 			power_supply_changed(di->psy);
 			return;
 		}
-		dev_err(di->dev, "set reverse charge failed, retry: %d\n", i);
 	}
-	dev_info(di->dev, "reverse charging failed start\n");
+	dev_err(di->dev, "reverse charging failed start\n");
 	idtp9418_set_reverse_gpio(di, false);
 	di->is_charging = false;
-	pm_relax(di->dev);
 }
 
 static void idtp9418_charge_monitor_work(struct work_struct *work)
 {
 	struct idtp9418_device_info *di = container_of(
 		work, struct idtp9418_device_info, charge_monitor_work.work);
-	static bool first_cycle = true;
 
 	idt_get_reverse_soc(di);
 
@@ -316,7 +269,7 @@ static void idtp9418_charge_monitor_work(struct work_struct *work)
 		goto queue_work;
 
 	idtp9418_set_reverse_gpio(di, false);
-	first_cycle = false;
+	di->charge_monitor_first = false;
 	di->is_charging = false;
 	power_supply_changed(di->psy);
 	goto push;
@@ -324,14 +277,11 @@ static void idtp9418_charge_monitor_work(struct work_struct *work)
 queue_work:
 	schedule_delayed_work(&di->charge_monitor_work,
 			      msecs_to_jiffies(CHARGE_MONITOR_INTERVAL));
-	if (!first_cycle)
+	if (!di->charge_monitor_first)
 		return;
 push:
 	idtp9418_push_event(di);
-	first_cycle = !first_cycle;
-	if (!first_cycle)
-		return;
-	pm_relax(di->dev);
+	di->charge_monitor_first = !di->charge_monitor_first;
 }
 
 static void reverse_chg_alarm_cb(struct alarm *alarm, ktime_t now)
@@ -359,59 +309,59 @@ static void reverse_dping_alarm_cb(struct alarm *alarm, ktime_t now)
 	power_supply_changed(di->psy);
 }
 
+#define EPT_FATAL_MASK \
+	(EPT_FOD | EPT_CMD | EPT_OCP | EPT_OVP | EPT_LVP | EPT_OTP | EPT_POCP)
+
 static void reverse_ept_type_get_work(struct work_struct *work)
 {
 	struct idtp9418_device_info *di = container_of(
 		work, struct idtp9418_device_info, reverse_ept_type_work.work);
 	int rc;
 	u8 buf[2] = { 0 };
-	u16 ept_val = 0;
+	u16 ept_val;
 
-	rc = di->bus.read_buf(di, REG_EPT_TYPE, buf, 2);
-	if (rc < 0)
+	rc = idtp9418_read_buffer(di, REG_EPT_TYPE, buf, 2);
+	if (rc < 0) {
 		dev_err(di->dev, "read tx ept type error: %d\n", rc);
-	else {
-		ept_val = buf[0] | (buf[1] << 8);
-		dev_info(di->dev, "tx ept type: 0x%04x\n", ept_val);
-		if (ept_val) {
-			if ((ept_val & EPT_FOD) || (ept_val & EPT_CMD) ||
-			    (ept_val & EPT_OCP) || (ept_val & EPT_OVP) ||
-			    (ept_val & EPT_LVP) || (ept_val & EPT_OTP) ||
-			    (ept_val & EPT_POCP)) {
-				dev_info(
-					di->dev,
-					"TX mode in ept and disable reverse charging\n");
-				idtp9418_set_reverse_gpio(di, false);
-			} else if (ept_val & EPT_CEP_TIMEOUT) {
-				dev_info(di->dev, "recheck ping state\n");
-			}
-			di->is_charging = false;
-			power_supply_changed(di->psy);
-		}
+		return;
 	}
+
+	ept_val = buf[0] | (buf[1] << 8);
+	dev_info(di->dev, "tx ept type: 0x%04x\n", ept_val);
+
+	if (!ept_val)
+		return;
+
+	if (ept_val & EPT_FATAL_MASK) {
+		dev_info(di->dev, "TX mode in ept, disable reverse charging\n");
+		idtp9418_set_reverse_gpio(di, false);
+	} else if (ept_val & EPT_CEP_TIMEOUT) {
+		dev_info(di->dev, "recheck ping state\n");
+	}
+
+	di->is_charging = false;
+	power_supply_changed(di->psy);
 }
 
 static void idtp9418_hall_irq_work(struct work_struct *work)
 {
 	struct idtp9418_device_info *di = container_of(
 		work, struct idtp9418_device_info, hall_irq_work.work);
-	bool attached = false;
+	bool attached;
 
-	if (!gpiod_get_value(di->hall3_gpiod))
-		attached = true;
-	if (!attached && !gpiod_get_value(di->hall4_gpiod))
-		attached = true;
+	attached = !gpiod_get_value(di->hall3_gpiod) ||
+		   !gpiod_get_value(di->hall4_gpiod);
 	di->is_attached = attached;
 
-	if (attached) {
-		dev_info(di->dev, "hall: pen attach\n");
-		idtp9418_set_reverse_gpio(di, true);
-		idtp9418_reverse_charge_enable(di);
-		alarm_start_relative(&di->reverse_dping_alarm,
-				     ms_to_ktime(REVERSE_DPING_CHECK_DELAY_MS));
-	} else {
-		pm_relax(di->dev);
-	}
+	if (!attached)
+		goto out;
+
+	idtp9418_set_reverse_gpio(di, true);
+	idtp9418_reverse_charge_enable(di);
+	alarm_start_relative(&di->reverse_dping_alarm,
+			     ms_to_ktime(REVERSE_DPING_CHECK_DELAY_MS));
+out:
+	pm_relax(di->dev);
 }
 
 static irqreturn_t idtp9418_irq_handler(int irq, void *dev_id)
@@ -436,17 +386,18 @@ static bool reverse_need_irq_cleared(struct idtp9418_device_info *di, u32 val)
 {
 	u8 int_buf[4];
 	u32 int_val;
-	int rc = -1;
+	int rc;
 
-	rc = di->bus.read_buf(di, REG_SYS_INT, int_buf, 4);
+	rc = idtp9418_read_buffer(di, REG_SYS_INT, int_buf, 4);
 	if (rc < 0) {
-		dev_err(di->dev, "%s: read int state error\n", __func__);
+		dev_err(di->dev, "read int state error\n");
 		return false;
 	}
 	int_val = int_buf[0] | (int_buf[1] << 8) | (int_buf[2] << 16) |
 		  (int_buf[3] << 24);
-	if (int_val && (int_val == val)) {
-		dev_info(di->dev, "irq clear wrong, retry: 0x%08x\n", int_val);
+
+	if (int_val && int_val == val) {
+		dev_err(di->dev, "irq clear wrong, retry: 0x%08x\n", int_val);
 		return true;
 	}
 	return false;
@@ -458,23 +409,22 @@ static void idtp9418_irq_work(struct work_struct *work)
 		container_of(work, struct idtp9418_device_info, irq_work.work);
 	u8 int_buf[4] = { 0 };
 	u8 clr_buf[4] = { 0xFF, 0xFF, 0xFF, 0xFF };
-	u32 int_val = 0;
+	u32 int_val;
 
 	if (gpiod_get_value(di->irq_gpiod))
-		goto reverse_out;
+		goto out;
 
-	if (di->bus.read_buf(di, REG_SYS_INT, int_buf, 4) < 0) {
-		dev_err(di->dev, "[idt]read int state error\n");
-		goto reverse_out;
+	if (idtp9418_read_buffer(di, REG_SYS_INT, int_buf, 4) < 0) {
+		dev_err(di->dev, "read int state error\n");
+		goto out;
 	}
 
 	if (!di->is_charging)
-		goto reverse_out;
+		goto out;
 
 	reverse_clrInt(di, int_buf, 4);
 	int_val = int_buf[0] | (int_buf[1] << 8) | (int_buf[2] << 16) |
 		  (int_buf[3] << 24);
-	dev_info(di->dev, "[idt] TRX int: 0x%08x\n", int_val);
 
 	msleep(5);
 	if (reverse_need_irq_cleared(di, int_val)) {
@@ -482,13 +432,11 @@ static void idtp9418_irq_work(struct work_struct *work)
 		msleep(5);
 	}
 
-	if (int_val & INT_EPT_TYPE) {
+	if (int_val & INT_EPT_TYPE)
 		schedule_delayed_work(&di->reverse_ept_type_work, 0);
-	}
 
 	if (int_val & INT_GET_DPING) {
-		dev_info(di->dev,
-			 "[idt] TRX get dping and disable reverse charging\n");
+		dev_info(di->dev, "TRX get dping, disable reverse charging\n");
 		idtp9418_set_reverse_gpio(di, false);
 		di->is_charging = false;
 		power_supply_changed(di->psy);
@@ -503,7 +451,6 @@ static void idtp9418_irq_work(struct work_struct *work)
 	}
 
 	if (int_val & INT_GET_CFG) {
-		dev_info(di->dev, "TRX get cfg, cancel alarm\n");
 		if (alarm_cancel(&di->reverse_chg_alarm) < 0)
 			dev_err(di->dev, "Couldn't cancel reverse_chg_alarm\n");
 		schedule_delayed_work(
@@ -511,9 +458,8 @@ static void idtp9418_irq_work(struct work_struct *work)
 			msecs_to_jiffies(CHARGE_MONITOR_INTERVAL));
 	}
 
-reverse_out:
+out:
 	pm_relax(di->dev);
-	return;
 }
 
 static int idtp9418_pinctrl_init(struct idtp9418_device_info *di)
@@ -707,16 +653,11 @@ static int idtp9418_probe(struct i2c_client *client)
 	di->charge_limit = LIMIT_SOC;
 	di->is_charging = false;
 	di->is_attached = false;
+	di->charge_monitor_first = true;
 
 	di->regmap = devm_regmap_init_i2c(client, &i2c_idtp9418_regmap_config);
 	if (!di->regmap)
 		return -ENODEV;
-
-	di->bus.read = idtp9418_read;
-	di->bus.write = idtp9418_write;
-	di->bus.read_buf = idtp9418_read_buffer;
-	di->bus.write_buf = idtp9418_write_buffer;
-	di->bus.mask_write = idtp9418_masked_write;
 
 	INIT_DELAYED_WORK(&di->irq_work, idtp9418_irq_work);
 	INIT_DELAYED_WORK(&di->hall_irq_work, idtp9418_hall_irq_work);
@@ -784,20 +725,15 @@ static int idtp9418_probe(struct i2c_client *client)
 		goto cleanup;
 	}
 
-	dev_info(di->dev, "[idt] success probe idtp9418 driver\n");
+	dev_info(di->dev, "idtp9418 probe success\n");
 	return 0;
 
 cleanup:
-	misc_deregister(&idtp9418_miscdev);
-	idtp9418_global_di = NULL;
 	cancel_delayed_work_sync(&di->irq_work);
 	cancel_delayed_work_sync(&di->hall_irq_work);
 	cancel_delayed_work_sync(&di->reverse_ept_type_work);
 	cancel_delayed_work_sync(&di->charge_monitor_work);
 	kfifo_free(&di->kfifo);
-	if (di->pinctrl)
-		pinctrl_put(di->pinctrl);
-	i2c_set_clientdata(client, NULL);
 	return ret;
 }
 
@@ -812,7 +748,6 @@ static void idtp9418_remove(struct i2c_client *client)
 	cancel_delayed_work_sync(&di->reverse_ept_type_work);
 	cancel_delayed_work_sync(&di->charge_monitor_work);
 	kfifo_free(&di->kfifo);
-	i2c_set_clientdata(client, NULL);
 }
 
 static const struct i2c_device_id idtp9418_id[] = {
