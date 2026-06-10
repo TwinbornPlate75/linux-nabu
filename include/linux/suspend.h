@@ -152,6 +152,8 @@ extern suspend_state_t mem_sleep_default;
  * @ops: The new suspend operations to set.
  */
 extern void suspend_set_ops(const struct platform_suspend_ops *ops);
+extern int suspend_set_ops_if_unused(const struct platform_suspend_ops *ops);
+extern bool suspend_ops_is_set(void);
 extern int suspend_valid_only_mem(suspend_state_t state);
 
 extern unsigned int pm_suspend_global_flags;
@@ -290,6 +292,8 @@ static inline bool pm_suspend_no_platform(void) { return false; }
 static inline bool pm_suspend_default_s2idle(void) { return false; }
 
 static inline void suspend_set_ops(const struct platform_suspend_ops *ops) {}
+static inline int suspend_set_ops_if_unused(const struct platform_suspend_ops *ops) { return -ENOSYS; }
+static inline bool suspend_ops_is_set(void) { return false; }
 static inline int pm_suspend(suspend_state_t state) { return -ENOSYS; }
 static inline bool sync_on_suspend_enabled(void) { return true; }
 static inline bool idle_should_enter_s2idle(void) { return false; }

@@ -213,18 +213,8 @@ static int __init mem_sleep_default_setup(char *str)
 }
 __setup("mem_sleep_default=", mem_sleep_default_setup);
 
-/**
- * suspend_set_ops - Set the global suspend method table.
- * @ops: Suspend operations to use.
- */
-void suspend_set_ops(const struct platform_suspend_ops *ops)
+static void suspend_state_setup(void)
 {
-	unsigned int sleep_flags;
-
-	sleep_flags = lock_system_sleep();
-
-	suspend_ops = ops;
-
 	if (valid_state(PM_SUSPEND_STANDBY)) {
 		mem_sleep_states[PM_SUSPEND_STANDBY] = mem_sleep_labels[PM_SUSPEND_STANDBY];
 		pm_states[PM_SUSPEND_STANDBY] = pm_labels[PM_SUSPEND_STANDBY];
@@ -236,10 +226,72 @@ void suspend_set_ops(const struct platform_suspend_ops *ops)
 		if (mem_sleep_default >= PM_SUSPEND_MEM)
 			mem_sleep_current = PM_SUSPEND_MEM;
 	}
+}
+
+/**
+ * suspend_set_ops - Set the global suspend method table.
+ * @ops: Suspend operations to use.
+ */
+void suspend_set_ops(const struct platform_suspend_ops *ops)
+{
+	unsigned int sleep_flags;
+
+	sleep_flags = lock_system_sleep();
+
+	suspend_ops = ops;
+	suspend_state_setup();
 
 	unlock_system_sleep(sleep_flags);
 }
 EXPORT_SYMBOL_GPL(suspend_set_ops);
+
+/**
+ * suspend_ops_is_set - Report whether any backend has registered a suspend op set.
+ *
+ * Used by alternative backends that want to register only when no other one is
+ * already active (so they can coexist with the canonical PSCI SYSTEM_SUSPEND
+ * path, which wins if firmware supports it).
+ */
+bool suspend_ops_is_set(void)
+{
+	bool set;
+	unsigned int sleep_flags;
+
+	sleep_flags = lock_system_sleep();
+	set = suspend_ops != NULL;
+	unlock_system_sleep(sleep_flags);
+
+	return set;
+}
+EXPORT_SYMBOL_GPL(suspend_ops_is_set);
+
+/**
+ * suspend_set_ops_if_unused - Install @ops only if no other backend registered.
+ * @ops: Suspend operations to install.
+ *
+ * Returns 0 on success (either @ops was installed or it was already the active
+ * one), -EBUSY if a different backend already owns suspend_ops.
+ */
+int suspend_set_ops_if_unused(const struct platform_suspend_ops *ops)
+{
+	unsigned int sleep_flags;
+	int ret = 0;
+
+	sleep_flags = lock_system_sleep();
+
+	if (suspend_ops && suspend_ops != ops) {
+		ret = -EBUSY;
+		goto out;
+	}
+
+	suspend_ops = ops;
+	suspend_state_setup();
+
+out:
+	unlock_system_sleep(sleep_flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(suspend_set_ops_if_unused);
 
 /**
  * suspend_valid_only_mem - Generic memory-only valid callback.
