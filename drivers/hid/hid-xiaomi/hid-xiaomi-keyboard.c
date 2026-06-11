@@ -45,8 +45,8 @@ struct xiaomi_priv {
 static struct list_head instances = LIST_HEAD_INIT(instances);
 static DEFINE_MUTEX(instances_lock);
 
-// Keyboard connection status, true by default
-static bool connected = true;
+// Keyboard connection status, false by default
+static bool connected = false;
 
 // Called by vendor driver
 void xiaomi_keyboard_connection_change(bool _connected)
@@ -157,20 +157,12 @@ static int xiaomi_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		goto err_3;
 	}
 
-	ret = xiaomi_safe_toggle(hdev, true);
-	if (ret) {
-		hid_err(hdev, "hid_hw_start failed\n");
-		goto err_3;
-	}
-
-	// Schedule an update to keep the keyboard in sync
-	mod_delayed_work(priv->connection_wq, &priv->connection_work,
-			 msecs_to_jiffies(CONNECTION_WAIT_INTERVAL));
-
 	// Add the instance to the list
 	mutex_lock(&instances_lock);
 	list_add(&priv->list, &instances);
 	mutex_unlock(&instances_lock);
+
+	xiaomi_safe_toggle(hdev, connected);
 
 	return 0;
 

@@ -475,8 +475,10 @@ static void set_keyboard_status(bool on)
 			}
 		}
 		mdata->keyboard_is_enable = true;
+		xiaomi_keyboard_connection_change(true);
 
 	} else if (!on && mdata->keyboard_is_enable) {
+		xiaomi_keyboard_connection_change(false);
 		if (!mdata->is_in_suspend) {
 			ret = pinctrl_select_state(mdata->pinctrl,
 						   mdata->pins_suspend);
