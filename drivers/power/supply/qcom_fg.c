@@ -26,6 +26,11 @@
 #define PARAM_ADDR_BATT_VOLTAGE 0x1a0
 #define PARAM_ADDR_BATT_CURRENT 0x1a2
 
+#define BATT_VOLTAGE_NUMR 122070
+#define BATT_VOLTAGE_DENR 1000
+#define BATT_CURRENT_NUMR 488281
+#define BATT_CURRENT_DENR 1000
+
 #define BATT_INFO_BASE 0x100
 #define MEM_IF_BASE 0x300
 #define MEM_IF_INT_RT_STS (MEM_IF_BASE + 0x10)
@@ -701,7 +706,7 @@ static int qcom_fg_get_current(struct qcom_fg_chip *chip, int *val)
 	temp = (s16)get_unaligned_le16(readval);
 
 	/* FG: discharge-positive.  Invert to power_supply (charge-positive). */
-	*val = -div_s64((s64)temp * 152587, 1000);
+	*val = -div_s64((s64)temp * BATT_CURRENT_NUMR, BATT_CURRENT_DENR);
 
 	return 0;
 }
@@ -719,7 +724,7 @@ static int qcom_fg_get_voltage(struct qcom_fg_chip *chip, int *val)
 	}
 
 	temp = get_unaligned_le16(readval);
-	*val = div_u64((u64)temp * 152587, 1000);
+	*val = div_u64((u64)temp * BATT_VOLTAGE_NUMR, BATT_VOLTAGE_DENR);
 
 	return 0;
 }
