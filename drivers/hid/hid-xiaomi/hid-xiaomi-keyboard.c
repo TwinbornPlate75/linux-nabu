@@ -24,21 +24,11 @@
 
 #include "../hid-ids.h"
 
-/**
- * Wait interval for the connection check to let the IRQ handler to settle down.
- */
-#define CONNECTION_WAIT_INTERVAL 1000 /* msec */
-
 struct xiaomi_priv {
 	struct list_head list;
-
 	struct hid_device *hdev;
 
 	bool enabled;
-	struct mutex enabled_lock;
-
-	struct workqueue_struct *connection_wq;
-	struct delayed_work connection_work;
 };
 
 // List of all instances
@@ -47,6 +37,29 @@ static DEFINE_MUTEX(instances_lock);
 
 // Keyboard connection status, false by default
 static bool connected = false;
+
+/**
+ * Updates the HID device status in a safe way.
+ * Needed to avoid a double-free in the HID core.
+ */
+static void xiaomi_safe_toggle(struct hid_device *hdev, bool enable)
+{
+	struct xiaomi_priv *priv = hid_get_drvdata(hdev);
+
+	if (priv->enabled == enable)
+		return;
+
+	if (enable) {
+		if (hid_hw_start(hdev, HID_CONNECT_DEFAULT)) {
+			hid_err(hdev, "hid_hw_start failed\n");
+			return;
+		}
+	} else {
+		hid_hw_stop(hdev);
+	}
+
+	priv->enabled = enable;
+}
 
 // Called by vendor driver
 void xiaomi_keyboard_connection_change(bool _connected)
@@ -57,56 +70,11 @@ void xiaomi_keyboard_connection_change(bool _connected)
 
 	mutex_lock(&instances_lock);
 	list_for_each_entry(instance, &instances, list) {
-		// Schedule the work, wait a sec before toggling the keyboard
-		mod_delayed_work(instance->connection_wq,
-				 &instance->connection_work,
-				 msecs_to_jiffies(CONNECTION_WAIT_INTERVAL));
+		xiaomi_safe_toggle(instance->hdev, connected);
 	}
 	mutex_unlock(&instances_lock);
 }
 EXPORT_SYMBOL_GPL(xiaomi_keyboard_connection_change);
-
-/**
- * Updates the HID device status in a safe way.
- * Needed to avoid a double-free in the HID core.
- */
-static int xiaomi_safe_toggle(struct hid_device *hdev, bool enable)
-{
-	struct xiaomi_priv *priv = hid_get_drvdata(hdev);
-	int ret = 0;
-
-	mutex_lock(&priv->enabled_lock);
-
-	if (priv->enabled == enable) {
-		goto done;
-	}
-
-	if (enable) {
-		ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
-		if (ret) {
-			hid_err(hdev, "hid_hw_start failed\n");
-			goto done;
-		}
-	} else {
-		hid_hw_stop(hdev);
-	}
-
-	priv->enabled = enable;
-
-done:
-	mutex_unlock(&priv->enabled_lock);
-
-	return ret;
-}
-
-static void xiaomi_connection_work(struct work_struct *work)
-{
-	struct xiaomi_priv *priv = container_of(
-		to_delayed_work(work), struct xiaomi_priv, connection_work);
-	struct hid_device *hdev = priv->hdev;
-
-	xiaomi_safe_toggle(hdev, connected);
-}
 
 static int xiaomi_input_configured(struct hid_device *hdev,
 				   struct hid_input *hi)
@@ -135,26 +103,15 @@ static int xiaomi_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		goto err_1;
 	}
 
-	// Setup workqueue
-	priv->connection_wq = create_singlethread_workqueue("hid-xiaomi");
-	if (!priv->connection_wq) {
-		ret = -ENOMEM;
-		goto err_2;
-	}
-	INIT_DELAYED_WORK(&priv->connection_work, xiaomi_connection_work);
-
 	priv->hdev = hdev;
 	priv->enabled = false;
-
-	// Setup the mutex
-	mutex_init(&priv->enabled_lock);
 
 	hid_set_drvdata(hdev, priv);
 
 	ret = hid_parse(hdev);
 	if (ret) {
 		hid_err(hdev, "hid_parse failed\n");
-		goto err_3;
+		goto err_2;
 	}
 
 	// Add the instance to the list
@@ -166,9 +123,6 @@ static int xiaomi_probe(struct hid_device *hdev, const struct hid_device_id *id)
 
 	return 0;
 
-err_3:
-	mutex_destroy(&priv->enabled_lock);
-	destroy_workqueue(priv->connection_wq);
 err_2:
 	kfree(priv);
 err_1:
@@ -184,17 +138,8 @@ static void xiaomi_remove(struct hid_device *hdev)
 	list_del(&priv->list);
 	mutex_unlock(&instances_lock);
 
-	// Wait for the work to finish
-	cancel_delayed_work_sync(&priv->connection_work);
-
 	// Stop the HID device
 	xiaomi_safe_toggle(hdev, false);
-
-	// Destroy the mutex
-	mutex_destroy(&priv->enabled_lock);
-
-	// Destroy the workqueue
-	destroy_workqueue(priv->connection_wq);
 
 	kfree(priv);
 }
