@@ -315,7 +315,8 @@ static int qcom_fg_sram_xfer(struct qcom_fg_chip *chip, u16 sram_addr,
 	ret = qcom_fg_dma_request(chip);
 	if (ret) {
 		dev_err(chip->dev, "Failed to request DMA access: %d\n", ret);
-		goto out;
+		mutex_unlock(&chip->dma_lock);
+		return ret;
 	}
 
 	while (len > 0) {
