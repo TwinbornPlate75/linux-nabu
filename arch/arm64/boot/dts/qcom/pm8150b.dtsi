@@ -198,9 +198,11 @@
 			compatible = "qcom,pm8150b-fg";
 			reg = <0x4000>;
 			interrupts-extended = <&spmi_bus 0x2 0x40 0x3 IRQ_TYPE_EDGE_RISING>,
-					      <&spmi_bus 0x2 0x43 0x4 IRQ_TYPE_EDGE_FALLING>;
+				      <&spmi_bus 0x2 0x43 0x1 IRQ_TYPE_EDGE_BOTH>,
+				      <&spmi_bus 0x2 0x43 0x4 IRQ_TYPE_EDGE_FALLING>;
 			interrupt-names = "soc-delta",
-					  "mem-attn";
+				  "ima-xcp",
+				  "mem-attn";
 			status = "disabled";
 		};
 

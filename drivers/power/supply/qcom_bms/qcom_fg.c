@@ -5,26 +5,31 @@
  * Qualcomm PM8150B Fuel Gauge (FG-GEN4) driver.
  */
 
+#include <linux/bitops.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/nvmem-consumer.h>
+#include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
+#include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
 
-/* SOC */
+#include "qcom_bms.h"
+
 #define BATT_MONOTONIC_SOC 0x009
 #define FULL_SOC_RAW 255
 #define FULL_SOC_REPORT_THR 250
 
-/* BATT (Gen4 uses ADC_RR for temperature) */
-#define ADC_RR_BATT_TEMP_LSB 0x288
 #define PARAM_ADDR_BATT_VOLTAGE 0x1a0
+#define PARAM_ADDR_BATT_VOLTAGE_CP 0x1a6
 #define PARAM_ADDR_BATT_CURRENT 0x1a2
+#define PARAM_ADDR_BATT_CURRENT_CP 0x1a8
 
 #define BATT_VOLTAGE_NUMR 122070
 #define BATT_VOLTAGE_DENR 1000
@@ -41,7 +46,6 @@
 #define BATT_INFO_PEEK_MUX4 (BATT_INFO_BASE + 0xEE)
 #define ALG_ACTIVE_PEEK_CFG 0xAC
 
-/* MEMIF bits */
 #define RIF_MEM_ACCESS_REQ BIT(7)
 #define GEN4_MEM_GNT_BIT BIT(3)
 #define MEM_ARB_REQ_BIT BIT(0)
@@ -50,7 +54,12 @@
 #define ADDR_KIND_BIT BIT(1)
 #define IACS_SLCT_BIT BIT(5)
 
-/* DMA partition mapping for Gen4 FG (PM8150B) */
+#define DMA_READ_ERROR_BIT BIT(2)
+#define DMA_WRITE_ERROR_BIT BIT(1)
+#define DMA_CLEAR_LOG_BIT BIT(0)
+
+#define MEM_XCP_BIT BIT(1)
+
 #define GEN4_FG_DMA0_BASE 0x4400
 #define GEN4_FG_DMA1_BASE 0x4500
 #define GEN4_FG_DMA2_BASE 0x4600
@@ -61,14 +70,11 @@
 #define FG_GEN4_NUM_PARTITIONS 6
 #define FG_GEN4_BYTES_PER_WORD 2
 
-/* SRAM word addresses (PM8150B V2) */
 #define PROFILE_LOAD_WORD 65
 #define PROFILE_INTEGRITY_WORD 299
 #define ESR_CAL_SOC_MIN_WORD 10
 #define ESR_CAL_THRESH_WORD 11
 #define ESR_PULSE_THRESH_WORD 12
-#define ESR_TIMER_FAST_CHG_WORD 15
-#define ESR_TIMER_FAST_DISCHG_WORD 16
 #define ESR_TIMER_DISCHG_WORD 17
 #define ESR_TIMER_CHG_WORD 18
 #define CUTOFF_CURR_WORD 19
@@ -90,17 +96,27 @@
 #define CYCLE_COUNT_WORD 291
 #define BATT_SOC_WORD 455
 #define CC_SOC_SW_WORD 464
+#define BATT_TEMP_WORD 328
 
-/* Profile constants */
+#define SDAM_COOKIE_OFFSET 0x80
+#define SDAM_CYCLE_COUNT_OFFSET 0x81
+#define SDAM_CAP_LEARN_OFFSET 0x91
+#define SDAM_CYCLE_VALID_OFFSET 0x93
+#define SDAM_COOKIE 0xa5
+#define SDAM_CYCLE_VALID 0xc35a
+
+#define FG_CYCLE_BUCKET_COUNT 8
+#define FG_CYCLE_BUCKET_SOC_RAW (256 / FG_CYCLE_BUCKET_COUNT)
+
 #define PROFILE_LOAD_BIT BIT(0)
 #define HLOS_RESTART_BIT BIT(3)
 #define PROFILE_LEN 416
 
-/* JEITA temperature thresholds (decidegrees C) */
 #define BATT_TEMP_JEITA_COLD 100
 #define BATT_TEMP_JEITA_HOT 450
+#define DEFAULT_CL_MIN_TEMP_DECIDEGC 150
+#define DEFAULT_CL_MAX_TEMP_DECIDEGC 500
 
-/* Capacity learning */
 #define CC_SOC_30BIT 0x3fffffff
 #define CENTI_FULL_SOC 10000
 #define BATT_SOC_32BIT 0xffffffff
@@ -129,11 +145,9 @@ struct qcom_fg_chip {
 	struct device *dev;
 	unsigned int base;
 	struct regmap *regmap;
-	struct notifier_block nb;
+	struct nvmem_device *nvmem;
 
-	struct power_supply *batt_psy;
 	struct power_supply_battery_info *batt_info;
-	struct power_supply *chg_psy;
 
 	/* Battery identification (set once during init_capacity_learning) */
 	const char *manufacturer;
@@ -150,6 +164,15 @@ struct qcom_fg_chip {
 	int cl_max_start_soc;
 	int cl_max_cap_inc;
 	int cl_max_cap_dec;
+	int cl_min_temp;
+	int cl_max_temp;
+
+	/* Cycle count is accumulated in eight 12.5%-SOC buckets. */
+	struct mutex cycle_lock;
+	u16 cycle_count[FG_CYCLE_BUCKET_COUNT];
+	bool cycle_started[FG_CYCLE_BUCKET_COUNT];
+	u8 cycle_last_soc[FG_CYCLE_BUCKET_COUNT];
+	int cycle_last_bucket;
 
 	struct completion mem_attn_done;
 	struct mutex dma_lock;
@@ -157,11 +180,11 @@ struct qcom_fg_chip {
 	/* Lock order: cl_lock -> state_lock. dma_lock is independent. */
 	struct mutex state_lock;
 	int status;
+	bool charge_done;
+	bool input_present;
 	int batt_soc;
 	s64 learned_cap_uah;
 };
-
-/* IO FUNCTIONS */
 
 static int qcom_fg_read(struct qcom_fg_chip *chip, u8 *val, u16 addr, int len)
 {
@@ -245,10 +268,53 @@ static irqreturn_t qcom_fg_mem_attn_irq_handler(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+static int qcom_fg_clear_dma_errors(struct qcom_fg_chip *chip)
+{
+	u8 dma_sts;
+	bool error_present;
+	int ret;
+
+	ret = qcom_fg_read(chip, &dma_sts, MEM_IF_DMA_STS, 1);
+	if (ret)
+		return ret;
+
+	error_present = dma_sts & (DMA_WRITE_ERROR_BIT | DMA_READ_ERROR_BIT);
+	return qcom_fg_masked_write(chip, MEM_IF_DMA_CTL, DMA_CLEAR_LOG_BIT,
+				    error_present ? DMA_CLEAR_LOG_BIT : 0);
+}
+
+static irqreturn_t qcom_fg_mem_xcp_irq_handler(int irq, void *data)
+{
+	struct qcom_fg_chip *chip = data;
+	u8 status;
+	int ret;
+
+	ret = qcom_fg_read(chip, &status, MEM_IF_INT_RT_STS, 1);
+	if (ret < 0) {
+		dev_err(chip->dev, "failed to read MEM_IF_INT_RT_STS: %d\n",
+			ret);
+		return IRQ_HANDLED;
+	}
+
+	mutex_lock(&chip->dma_lock);
+	ret = qcom_fg_clear_dma_errors(chip);
+	mutex_unlock(&chip->dma_lock);
+	if (ret < 0)
+		dev_err(chip->dev, "Error in clearing DMA error: %d\n", ret);
+
+	if (status & MEM_XCP_BIT)
+		dev_err(chip->dev, "MEM_XCP asserted, status=0x%02x\n", status);
+
+	return IRQ_HANDLED;
+}
+
 static int qcom_fg_dma_request(struct qcom_fg_chip *chip)
 {
 	u8 sts;
 	int ret;
+
+	/* Arm the completion before asserting the request to avoid losing IRQs. */
+	reinit_completion(&chip->mem_attn_done);
 
 	ret = qcom_fg_masked_write(chip, MEM_IF_MEM_ARB_CFG, MEM_ARB_REQ_BIT,
 				   MEM_ARB_REQ_BIT);
@@ -269,7 +335,6 @@ static int qcom_fg_dma_request(struct qcom_fg_chip *chip)
 	if (sts & GEN4_MEM_GNT_BIT)
 		return 0;
 
-	reinit_completion(&chip->mem_attn_done);
 	if (!wait_for_completion_timeout(&chip->mem_attn_done,
 					 msecs_to_jiffies(1000))) {
 		ret = -ETIMEDOUT;
@@ -292,11 +357,17 @@ out_release_arb:
 	return ret;
 }
 
-static void qcom_fg_dma_release(struct qcom_fg_chip *chip)
+static int qcom_fg_dma_release(struct qcom_fg_chip *chip)
 {
-	qcom_fg_masked_write(chip, MEM_INTF_CFG,
-			     RIF_MEM_ACCESS_REQ | IACS_SLCT_BIT, 0);
-	qcom_fg_masked_write(chip, MEM_IF_MEM_ARB_CFG, MEM_ARB_REQ_BIT, 0);
+	int arb_ret;
+	int ret;
+
+	ret = qcom_fg_masked_write(chip, MEM_INTF_CFG,
+				   RIF_MEM_ACCESS_REQ | IACS_SLCT_BIT, 0);
+	arb_ret = qcom_fg_masked_write(chip, MEM_IF_MEM_ARB_CFG,
+				       MEM_ARB_REQ_BIT, 0);
+
+	return ret ?: arb_ret;
 }
 
 /* @offset < FG_GEN4_BYTES_PER_WORD. */
@@ -307,8 +378,8 @@ static int qcom_fg_sram_xfer(struct qcom_fg_chip *chip, u16 sram_addr,
 	u16 addr;
 	int num_bytes, ret;
 
-	WARN_ON(offset >= FG_GEN4_BYTES_PER_WORD);
-	WARN_ON(len <= 0);
+	if (WARN_ON_ONCE(offset >= FG_GEN4_BYTES_PER_WORD || len <= 0))
+		return -EINVAL;
 
 	mutex_lock(&chip->dma_lock);
 
@@ -343,8 +414,12 @@ static int qcom_fg_sram_xfer(struct qcom_fg_chip *chip, u16 sram_addr,
 		offset = 0;
 	}
 
-out:
-	qcom_fg_dma_release(chip);
+out: {
+	int release_ret = qcom_fg_dma_release(chip);
+
+	if (!ret)
+		ret = release_ret;
+}
 	mutex_unlock(&chip->dma_lock);
 	return ret;
 }
@@ -374,8 +449,12 @@ static int qcom_fg_dma_init(struct qcom_fg_chip *chip)
 		return ret;
 	}
 
-	/* Release DMA so that request can happen */
-	qcom_fg_dma_release(chip);
+	/* Release DMA so that request can happen. */
+	ret = qcom_fg_dma_release(chip);
+	if (ret) {
+		dev_err(chip->dev, "Failed to release DMA access: %d\n", ret);
+		return ret;
+	}
 
 	/* Set low latency and clear log bit */
 	ret = qcom_fg_masked_write(chip, MEM_IF_MEM_ARB_CFG,
@@ -397,8 +476,6 @@ static int qcom_fg_dma_init(struct qcom_fg_chip *chip)
 
 	return 0;
 }
-
-/* CAPACITY LEARNING */
 
 static int qcom_fg_get_cc_soc_sw(struct qcom_fg_chip *chip, int *cc_soc_sw)
 {
@@ -422,33 +499,126 @@ static int qcom_fg_prime_cc_soc_sw(struct qcom_fg_chip *chip, u32 cc_soc_sw)
 	return qcom_fg_sram_write(chip, CC_SOC_SW_WORD, 0, buf, 4);
 }
 
-static int qcom_fg_get_batt_soc_cp(struct qcom_fg_chip *chip, int *batt_soc_cp)
+static int qcom_fg_get_batt_soc(struct qcom_fg_chip *chip, int *batt_soc_cp,
+				u8 *batt_soc_raw)
 {
 	u8 buf[4];
 	u32 batt_soc;
 	int ret;
 
-	ret = qcom_fg_sram_read(chip, BATT_SOC_WORD, 0, buf, 4);
+	ret = qcom_fg_sram_read(chip, BATT_SOC_WORD, 0, buf, sizeof(buf));
 	if (ret)
 		return ret;
 
 	batt_soc = get_unaligned_le32(buf);
-	*batt_soc_cp =
-		div64_u64((u64)batt_soc * CENTI_FULL_SOC, BATT_SOC_32BIT);
+	if (batt_soc_cp)
+		*batt_soc_cp = div64_u64((u64)batt_soc * CENTI_FULL_SOC,
+					 BATT_SOC_32BIT);
+	if (batt_soc_raw)
+		*batt_soc_raw = batt_soc >> 24;
+
 	return 0;
+}
+
+static int qcom_fg_read_sram_learned_capacity(struct qcom_fg_chip *chip,
+					      s64 *cap_uah)
+{
+	u8 buf[2];
+	int ret;
+
+	ret = qcom_fg_sram_read(chip, ACT_BATT_CAP_WORD, 0, buf, sizeof(buf));
+	if (ret)
+		return ret;
+
+	*cap_uah = (s64)get_unaligned_le16(buf) * 1000;
+	return *cap_uah > 0 ? 0 : -ENODATA;
+}
+
+static int qcom_fg_write_sram_learned_capacity(struct qcom_fg_chip *chip,
+					       u8 *buf)
+{
+	return qcom_fg_sram_write(chip, ACT_BATT_CAP_WORD, 0, buf, 2);
+}
+
+static int qcom_fg_read_sdam_learned_capacity(struct qcom_fg_chip *chip,
+					      s64 *cap_uah)
+{
+	u8 buf[2], cookie;
+	int ret;
+
+	ret = nvmem_device_read(chip->nvmem, SDAM_COOKIE_OFFSET, 1, &cookie);
+	if (ret < 0)
+		return ret;
+	if (ret != 1)
+		return -EIO;
+	if (cookie != SDAM_COOKIE)
+		return -ENODATA;
+
+	ret = nvmem_device_read(chip->nvmem, SDAM_CAP_LEARN_OFFSET, sizeof(buf),
+				buf);
+	if (ret < 0)
+		return ret;
+	if (ret != sizeof(buf))
+		return -EIO;
+
+	*cap_uah = (s64)get_unaligned_le16(buf) * 1000;
+	return *cap_uah > 0 ? 0 : -ENODATA;
+}
+
+static int qcom_fg_write_sdam_learned_capacity(struct qcom_fg_chip *chip,
+					       u8 *buf)
+{
+	u8 cookie = SDAM_COOKIE;
+	int ret;
+
+	ret = nvmem_device_write(chip->nvmem, SDAM_CAP_LEARN_OFFSET, 2, buf);
+	if (ret < 0)
+		return ret;
+	if (ret != 2)
+		return -EIO;
+
+	ret = nvmem_device_write(chip->nvmem, SDAM_COOKIE_OFFSET, 1, &cookie);
+	if (ret < 0)
+		return ret;
+
+	return ret == 1 ? 0 : -EIO;
 }
 
 static int qcom_fg_get_learned_capacity(struct qcom_fg_chip *chip, s64 *cap_uah)
 {
 	u8 buf[2];
-	int cc_mah, ret;
+	int ret;
 
-	ret = qcom_fg_sram_read(chip, ACT_BATT_CAP_WORD, 0, buf, 2);
+	if (!chip->nvmem)
+		return qcom_fg_read_sram_learned_capacity(chip, cap_uah);
+
+	ret = qcom_fg_read_sdam_learned_capacity(chip, cap_uah);
+	if (!ret) {
+		put_unaligned_le16(div_s64(*cap_uah, 1000), buf);
+		ret = qcom_fg_write_sram_learned_capacity(chip, buf);
+		if (ret)
+			dev_warn(
+				chip->dev,
+				"Failed to restore learned capacity to SRAM: %d\n",
+				ret);
+		return 0;
+	}
+
+	if (ret != -ENODATA)
+		dev_warn(chip->dev,
+			 "Failed to read learned capacity from SDAM: %d\n",
+			 ret);
+
+	ret = qcom_fg_read_sram_learned_capacity(chip, cap_uah);
 	if (ret)
 		return ret;
 
-	cc_mah = get_unaligned_le16(buf);
-	*cap_uah = (s64)cc_mah * 1000;
+	put_unaligned_le16(div_s64(*cap_uah, 1000), buf);
+	ret = qcom_fg_write_sdam_learned_capacity(chip, buf);
+	if (ret)
+		dev_warn(chip->dev,
+			 "Failed to seed learned capacity in SDAM: %d\n", ret);
+
 	return 0;
 }
 
@@ -456,25 +626,207 @@ static int qcom_fg_store_learned_capacity(struct qcom_fg_chip *chip,
 					  s64 learned_cap_uah)
 {
 	u8 buf[2];
-	int cc_mah;
+	int cc_mah, ret;
+
+	if (learned_cap_uah <= 0 || learned_cap_uah > (s64)U16_MAX * 1000)
+		return -ERANGE;
 
 	cc_mah = (int)div_s64(learned_cap_uah, 1000);
 	put_unaligned_le16(cc_mah, buf);
 
-	return qcom_fg_sram_write(chip, ACT_BATT_CAP_WORD, 0, buf, 2);
+	ret = qcom_fg_write_sram_learned_capacity(chip, buf);
+	if (ret || !chip->nvmem)
+		return ret;
+
+	return qcom_fg_write_sdam_learned_capacity(chip, buf);
 }
 
-/* Cycle counter mirrored by FG HW (word 291, 2 bytes LE). */
-static int qcom_fg_get_cycle_count(struct qcom_fg_chip *chip, int *count)
+/*
+ * The Gen4 FG tracks charge throughput in eight SOC buckets.  SDAM retains
+ * the bucket counters across hard resets; SRAM is kept in sync for firmware
+ * compatibility and as a fallback when SDAM is unavailable.
+ */
+static int qcom_fg_write_cycle_marker(struct qcom_fg_chip *chip)
+{
+	u8 marker[2];
+	int ret;
+
+	put_unaligned_le16(SDAM_CYCLE_VALID, marker);
+	ret = nvmem_device_write(chip->nvmem, SDAM_CYCLE_VALID_OFFSET,
+				 sizeof(marker), marker);
+	if (ret < 0)
+		return ret;
+
+	return ret == sizeof(marker) ? 0 : -EIO;
+}
+
+static int qcom_fg_write_sdam_cycle_counts(struct qcom_fg_chip *chip, u8 *buf,
+					   size_t len, unsigned int offset)
+{
+	int ret;
+
+	ret = nvmem_device_write(chip->nvmem, SDAM_CYCLE_COUNT_OFFSET + offset,
+				 len, buf);
+	if (ret < 0)
+		return ret;
+
+	return ret == len ? 0 : -EIO;
+}
+
+static int qcom_fg_restore_cycle_count(struct qcom_fg_chip *chip)
+{
+	u8 buf[FG_CYCLE_BUCKET_COUNT * sizeof(u16)];
+	u8 marker[2] = {};
+	bool restore_sdam = false;
+	int i, ret;
+
+	if (chip->nvmem) {
+		ret = nvmem_device_read(chip->nvmem, SDAM_CYCLE_VALID_OFFSET,
+					sizeof(marker), marker);
+		if (ret == sizeof(marker) &&
+		    get_unaligned_le16(marker) == SDAM_CYCLE_VALID) {
+			ret = nvmem_device_read(chip->nvmem,
+						SDAM_CYCLE_COUNT_OFFSET,
+						sizeof(buf), buf);
+			if (ret == sizeof(buf))
+				restore_sdam = true;
+			else
+				dev_warn(
+					chip->dev,
+					"Failed to restore cycle count from SDAM: %d\n",
+					ret < 0 ? ret : -EIO);
+		} else if (ret < 0) {
+			dev_warn(chip->dev,
+				 "Failed to read cycle-count SDAM marker: %d\n",
+				 ret);
+		}
+	}
+
+	if (!restore_sdam) {
+		ret = qcom_fg_sram_read(chip, CYCLE_COUNT_WORD, 0, buf,
+					sizeof(buf));
+		if (ret)
+			return ret;
+
+		if (chip->nvmem) {
+			ret = qcom_fg_write_sdam_cycle_counts(chip, buf,
+							      sizeof(buf), 0);
+			if (!ret)
+				ret = qcom_fg_write_cycle_marker(chip);
+			if (ret)
+				dev_warn(
+					chip->dev,
+					"Failed to seed cycle count in SDAM: %d\n",
+					ret);
+		}
+	} else {
+		ret = qcom_fg_sram_write(chip, CYCLE_COUNT_WORD, 0, buf,
+					 sizeof(buf));
+		if (ret)
+			dev_warn(chip->dev,
+				 "Failed to restore cycle count to SRAM: %d\n",
+				 ret);
+	}
+
+	mutex_lock(&chip->cycle_lock);
+	for (i = 0; i < FG_CYCLE_BUCKET_COUNT; i++)
+		chip->cycle_count[i] = get_unaligned_le16(buf + i * 2);
+	mutex_unlock(&chip->cycle_lock);
+
+	return 0;
+}
+
+static int qcom_fg_store_cycle_bucket(struct qcom_fg_chip *chip, int id,
+				      u16 count)
 {
 	u8 buf[2];
 	int ret;
 
-	ret = qcom_fg_sram_read(chip, CYCLE_COUNT_WORD, 0, buf, 2);
-	if (ret)
-		return ret;
+	put_unaligned_le16(count, buf);
 
-	*count = get_unaligned_le16(buf);
+	if (chip->nvmem) {
+		ret = qcom_fg_write_sdam_cycle_counts(chip, buf, sizeof(buf),
+						      id * sizeof(u16));
+		if (ret)
+			return ret;
+
+		ret = qcom_fg_sram_write(chip, CYCLE_COUNT_WORD + id, 0, buf,
+					 sizeof(buf));
+		if (ret)
+			dev_warn(
+				chip->dev,
+				"Failed to mirror cycle bucket %d to SRAM: %d\n",
+				id, ret);
+
+		return 0;
+	}
+
+	return qcom_fg_sram_write(chip, CYCLE_COUNT_WORD + id, 0, buf,
+				  sizeof(buf));
+}
+
+static void qcom_fg_cycle_count_update(struct qcom_fg_chip *chip, u8 batt_soc,
+				       int status, bool charge_done,
+				       bool input_present)
+{
+	int id = batt_soc / FG_CYCLE_BUCKET_SOC_RAW;
+	int i, ret;
+	u16 count;
+
+	mutex_lock(&chip->cycle_lock);
+
+	if (status == POWER_SUPPLY_STATUS_CHARGING) {
+		if (!chip->cycle_started[id] && id != chip->cycle_last_bucket) {
+			chip->cycle_started[id] = true;
+			chip->cycle_last_soc[id] = batt_soc;
+		}
+	} else if (charge_done || !input_present) {
+		for (i = 0; i < FG_CYCLE_BUCKET_COUNT; i++) {
+			if (!chip->cycle_started[i] ||
+			    batt_soc <= chip->cycle_last_soc[i] +
+						FG_CYCLE_BUCKET_SOC_RAW / 2)
+				continue;
+
+			if (chip->cycle_count[i] == U16_MAX) {
+				chip->cycle_started[i] = false;
+				chip->cycle_last_soc[i] = 0;
+				chip->cycle_last_bucket = i;
+				continue;
+			}
+
+			count = chip->cycle_count[i] + 1;
+			ret = qcom_fg_store_cycle_bucket(chip, i, count);
+			if (ret) {
+				dev_warn(
+					chip->dev,
+					"Failed to store cycle bucket %d: %d\n",
+					i, ret);
+				continue;
+			}
+
+			chip->cycle_count[i] = count;
+			chip->cycle_started[i] = false;
+			chip->cycle_last_soc[i] = 0;
+			chip->cycle_last_bucket = i;
+			dev_dbg(chip->dev, "Cycle bucket %d count=%u\n", i,
+				count);
+		}
+	}
+
+	mutex_unlock(&chip->cycle_lock);
+}
+
+static int qcom_fg_get_cycle_count(struct qcom_fg_chip *chip, int *count)
+{
+	u32 sum = 0;
+	int i;
+
+	mutex_lock(&chip->cycle_lock);
+	for (i = 0; i < FG_CYCLE_BUCKET_COUNT; i++)
+		sum += chip->cycle_count[i];
+	mutex_unlock(&chip->cycle_lock);
+
+	*count = sum / FG_CYCLE_BUCKET_COUNT;
 	return 0;
 }
 
@@ -585,77 +937,104 @@ out:
 	return ret;
 }
 
-/* IDLE + CHARGING → begin; LEARNING + FULL → done; LEARNING + DISCHARGING → abort. */
-static void qcom_fg_cap_learning_update(struct qcom_fg_chip *chip)
+static void qcom_fg_cap_learning_abort(struct qcom_fg_chip *chip,
+				       int batt_soc_cp, const char *reason)
 {
-	int batt_soc_cp;
-	int status;
+	u32 batt_soc_prime;
+	int ret;
+
+	chip->cl_active = false;
+	batt_soc_prime =
+		div64_u64((u64)batt_soc_cp * CC_SOC_30BIT, CENTI_FULL_SOC);
+	ret = qcom_fg_prime_cc_soc_sw(chip, batt_soc_prime);
+	if (ret)
+		dev_warn(
+			chip->dev,
+			"Failed to reset CC_SOC after capacity-learning abort: %d\n",
+			ret);
+
+	dev_dbg(chip->dev, "Cap learning aborted: %s\n", reason);
+}
+
+static void qcom_fg_cap_learning_update(struct qcom_fg_chip *chip,
+					int batt_temp, int batt_soc_cp,
+					int status, bool charge_done,
+					bool input_present)
+{
 	bool has_cap;
 
 	mutex_lock(&chip->state_lock);
 	has_cap = chip->learned_cap_uah > 0;
-	status = chip->status;
 	mutex_unlock(&chip->state_lock);
-
 	if (!has_cap)
 		return;
 
 	mutex_lock(&chip->cl_lock);
 
-	if (qcom_fg_get_batt_soc_cp(chip, &batt_soc_cp))
+	if (batt_temp < chip->cl_min_temp || batt_temp > chip->cl_max_temp) {
+		if (chip->cl_active) {
+			qcom_fg_cap_learning_abort(chip, batt_soc_cp,
+						   "temperature out of range");
+		}
 		goto unlock;
+	}
 
 	if (chip->cl_active) {
-		/* LEARNING state: check for termination conditions. */
-		switch (status) {
-		case POWER_SUPPLY_STATUS_FULL:
-			/* Session complete — finalize or retry on failure. */
+		if (charge_done) {
 			if (qcom_fg_cap_learning_done(chip))
 				dev_warn(chip->dev,
 					 "Cap learning finalization failed\n");
-			break;
-		case POWER_SUPPLY_STATUS_DISCHARGING:
-			/* Discharge invalidates the session — abort. */
-			chip->cl_active = false;
-			dev_dbg(chip->dev,
-				"Cap learning aborted: discharging\n");
-			break;
-		default:
-			/* CHARGING / NOT_CHARGING / UNKNOWN — keep learning. */
-			break;
+		} else if (status == POWER_SUPPLY_STATUS_NOT_CHARGING) {
+			qcom_fg_cap_learning_abort(chip, batt_soc_cp,
+						   "charging stopped");
+		} else if (status == POWER_SUPPLY_STATUS_DISCHARGING &&
+			   !input_present) {
+			qcom_fg_cap_learning_abort(chip, batt_soc_cp,
+						   "input removed");
 		}
-	} else {
-		/* IDLE state: start a new session when charging begins. */
-		if (status == POWER_SUPPLY_STATUS_CHARGING) {
-			if (qcom_fg_cap_learning_begin(chip, batt_soc_cp))
-				dev_dbg(chip->dev,
-					"Cap learning begin failed\n");
-		}
+	} else if (status == POWER_SUPPLY_STATUS_CHARGING && input_present) {
+		if (qcom_fg_cap_learning_begin(chip, batt_soc_cp))
+			dev_dbg(chip->dev, "Cap learning begin failed\n");
 	}
 
 unlock:
 	mutex_unlock(&chip->cl_lock);
 }
 
-/* BATTERY STATUS */
+#define FG_MAX_READ_TRIES 5
 
 static int qcom_fg_get_capacity(struct qcom_fg_chip *chip, int *val)
 {
 	bool report_full;
 	u8 cap[2];
-	int ret;
+	int ret, tries = 0;
 
-	ret = qcom_fg_read(chip, cap, BATT_MONOTONIC_SOC, 2);
-	if (ret) {
-		dev_err(chip->dev, "Failed to read capacity: %d\n", ret);
-		return ret;
+	/*
+	 * MONOTONIC_SOC has shadow registers at offset 0x09 and 0x0A. Retry
+	 * until they match; do not fall back to min() which can under-report.
+	 */
+	while (tries < FG_MAX_READ_TRIES) {
+		ret = qcom_fg_read(chip, cap, BATT_MONOTONIC_SOC, 2);
+		if (ret) {
+			dev_err(chip->dev, "Failed to read capacity: %d\n",
+				ret);
+			return ret;
+		}
+
+		if (cap[0] == cap[1])
+			break;
+
+		tries++;
+	}
+
+	if (tries == FG_MAX_READ_TRIES) {
+		dev_err(chip->dev, "MSOC: shadow registers do not match\n");
+		return -EINVAL;
 	}
 
 	mutex_lock(&chip->state_lock);
 	report_full = (chip->status == POWER_SUPPLY_STATUS_FULL);
 	mutex_unlock(&chip->state_lock);
-
-	cap[0] = min(cap[0], cap[1]);
 
 	if (cap[0] == 0) {
 		*val = 0;
@@ -677,34 +1056,86 @@ static int qcom_fg_get_capacity(struct qcom_fg_chip *chip, int *val)
 
 static int qcom_fg_get_temperature(struct qcom_fg_chip *chip, int *val)
 {
-	int temp;
 	u8 readval[2];
 	int ret;
 
-	ret = qcom_fg_read(chip, readval, ADC_RR_BATT_TEMP_LSB, 2);
+	ret = qcom_fg_sram_read(chip, BATT_TEMP_WORD, 0, readval, 2);
 	if (ret) {
-		dev_err(chip->dev, "Failed to read temperature: %d\n", ret);
+		dev_err(chip->dev, "Failed to read battery temperature: %d\n",
+			ret);
 		return ret;
 	}
 
-	temp = (s16)get_unaligned_le16(readval);
-	*val = temp * 10;
+	*val = sign_extend32(get_unaligned_le16(readval), 9) * 100 / 40;
 	return 0;
+}
+
+static void qcom_fg_algorithms_update(struct qcom_fg_chip *chip)
+{
+	bool charge_done, input_present;
+	u8 batt_soc_raw;
+	int batt_soc_cp, batt_temp, status;
+	int ret;
+
+	mutex_lock(&chip->state_lock);
+	status = chip->status;
+	charge_done = chip->charge_done;
+	input_present = chip->input_present;
+	mutex_unlock(&chip->state_lock);
+
+	ret = qcom_fg_get_batt_soc(chip, &batt_soc_cp, &batt_soc_raw);
+	if (ret) {
+		dev_warn(chip->dev,
+			 "Failed to read SOC for FG algorithms: %d\n", ret);
+		return;
+	}
+
+	qcom_fg_cycle_count_update(chip, batt_soc_raw, status, charge_done,
+				   input_present);
+
+	ret = qcom_fg_get_temperature(chip, &batt_temp);
+	if (ret)
+		return;
+
+	qcom_fg_cap_learning_update(chip, batt_temp, batt_soc_cp, status,
+				    charge_done, input_present);
 }
 
 static int qcom_fg_get_current(struct qcom_fg_chip *chip, int *val)
 {
 	s16 temp;
-	u8 readval[2];
-	int ret;
+	u8 buf[2], buf_cp[2];
+	int ret, tries = 0;
 
-	ret = qcom_fg_read(chip, readval, PARAM_ADDR_BATT_CURRENT, 2);
-	if (ret) {
-		dev_err(chip->dev, "Failed to read current: %d\n", ret);
-		return ret;
+	/*
+	 * IBATT has shadow registers at 0xA2 and 0xA8. Retry until they match.
+	 */
+	while (tries < FG_MAX_READ_TRIES) {
+		ret = qcom_fg_read(chip, buf, PARAM_ADDR_BATT_CURRENT, 2);
+		if (ret) {
+			dev_err(chip->dev, "Failed to read current: %d\n", ret);
+			return ret;
+		}
+
+		ret = qcom_fg_read(chip, buf_cp, PARAM_ADDR_BATT_CURRENT_CP, 2);
+		if (ret) {
+			dev_err(chip->dev, "Failed to read current CP: %d\n",
+				ret);
+			return ret;
+		}
+
+		if (buf[0] == buf_cp[0] && buf[1] == buf_cp[1])
+			break;
+
+		tries++;
 	}
 
-	temp = (s16)get_unaligned_le16(readval);
+	if (tries == FG_MAX_READ_TRIES) {
+		dev_err(chip->dev, "IBATT: shadow registers do not match\n");
+		return -EINVAL;
+	}
+
+	temp = (s16)get_unaligned_le16(buf);
 
 	/* FG: discharge-positive.  Invert to power_supply (charge-positive). */
 	*val = -div_s64((s64)temp * BATT_CURRENT_NUMR, BATT_CURRENT_DENR);
@@ -714,259 +1145,360 @@ static int qcom_fg_get_current(struct qcom_fg_chip *chip, int *val)
 
 static int qcom_fg_get_voltage(struct qcom_fg_chip *chip, int *val)
 {
-	int temp;
-	u8 readval[2];
-	int ret;
+	u8 buf[2], buf_cp[2];
+	int ret, tries = 0;
 
-	ret = qcom_fg_read(chip, readval, PARAM_ADDR_BATT_VOLTAGE, 2);
-	if (ret) {
-		dev_err(chip->dev, "Failed to read voltage: %d\n", ret);
-		return ret;
+	/*
+	 * VBATT has shadow registers at 0xA0 and 0xA6. Retry until they match.
+	 */
+	while (tries < FG_MAX_READ_TRIES) {
+		ret = qcom_fg_read(chip, buf, PARAM_ADDR_BATT_VOLTAGE, 2);
+		if (ret) {
+			dev_err(chip->dev, "Failed to read voltage: %d\n", ret);
+			return ret;
+		}
+
+		ret = qcom_fg_read(chip, buf_cp, PARAM_ADDR_BATT_VOLTAGE_CP, 2);
+		if (ret) {
+			dev_err(chip->dev, "Failed to read voltage CP: %d\n",
+				ret);
+			return ret;
+		}
+
+		if (buf[0] == buf_cp[0] && buf[1] == buf_cp[1])
+			break;
+
+		tries++;
 	}
 
-	temp = get_unaligned_le16(readval);
-	*val = div_u64((u64)temp * BATT_VOLTAGE_NUMR, BATT_VOLTAGE_DENR);
+	if (tries == FG_MAX_READ_TRIES) {
+		dev_err(chip->dev, "VBATT: shadow registers do not match\n");
+		return -EINVAL;
+	}
+
+	*val = div_u64((u64)get_unaligned_le16(buf) * BATT_VOLTAGE_NUMR,
+		       BATT_VOLTAGE_DENR);
 
 	return 0;
 }
 
-/* BATTERY POWER SUPPLY */
-
-static enum power_supply_property qcom_fg_props[] = {
-	POWER_SUPPLY_PROP_STATUS,
-	POWER_SUPPLY_PROP_TECHNOLOGY,
-	POWER_SUPPLY_PROP_CAPACITY,
-	POWER_SUPPLY_PROP_CAPACITY_LEVEL,
-	POWER_SUPPLY_PROP_CURRENT_NOW,
-	POWER_SUPPLY_PROP_VOLTAGE_NOW,
-	POWER_SUPPLY_PROP_POWER_NOW,
-	POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN,
-	POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN,
-	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
-	POWER_SUPPLY_PROP_CHARGE_FULL,
-	POWER_SUPPLY_PROP_CHARGE_NOW,
-	POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN,
-	POWER_SUPPLY_PROP_ENERGY_FULL,
-	POWER_SUPPLY_PROP_ENERGY_NOW,
-	POWER_SUPPLY_PROP_CYCLE_COUNT,
-	POWER_SUPPLY_PROP_HEALTH,
-	POWER_SUPPLY_PROP_PRESENT,
-	POWER_SUPPLY_PROP_TEMP,
-	POWER_SUPPLY_PROP_SCOPE,
-	POWER_SUPPLY_PROP_MANUFACTURER,
-	POWER_SUPPLY_PROP_MODEL_NAME,
-};
-
-static int qcom_fg_get_property(struct power_supply *psy,
-				enum power_supply_property psp,
-				union power_supply_propval *val)
+static int qcom_fg_parse_battery_info(struct qcom_fg_chip *chip)
 {
-	struct qcom_fg_chip *chip = power_supply_get_drvdata(psy);
-	int ret = 0;
+	struct device *dev = chip->dev;
+	struct device_node *node = dev->of_node;
+	struct device_node *batt_np;
+	struct power_supply_battery_info *info;
+	u32 val;
 
-	switch (psp) {
-	case POWER_SUPPLY_PROP_STATUS:
-		mutex_lock(&chip->state_lock);
-		val->intval = chip->status;
-		mutex_unlock(&chip->state_lock);
-		break;
-	case POWER_SUPPLY_PROP_TECHNOLOGY:
-		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
-		break;
-	case POWER_SUPPLY_PROP_CAPACITY: {
-		mutex_lock(&chip->state_lock);
-		val->intval = chip->batt_soc;
-		mutex_unlock(&chip->state_lock);
-		break;
-	}
-	case POWER_SUPPLY_PROP_CAPACITY_LEVEL: {
-		int soc;
-
-		mutex_lock(&chip->state_lock);
-		soc = chip->batt_soc;
-		mutex_unlock(&chip->state_lock);
-
-		if (soc >= 100)
-			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_FULL;
-		else if (soc >= 90)
-			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_HIGH;
-		else if (soc >= 20)
-			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
-		else if (soc >= 5)
-			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_LOW;
-		else if (soc > 0)
-			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL;
-		else
-			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_UNKNOWN;
-		break;
-	}
-	case POWER_SUPPLY_PROP_CURRENT_NOW:
-		ret = qcom_fg_get_current(chip, &val->intval);
-		break;
-	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
-		ret = qcom_fg_get_voltage(chip, &val->intval);
-		break;
-	case POWER_SUPPLY_PROP_POWER_NOW: {
-		int voltage_uv, current_ua;
-		s64 power_uw;
-
-		ret = qcom_fg_get_voltage(chip, &voltage_uv);
-		if (ret)
-			break;
-		ret = qcom_fg_get_current(chip, &current_ua);
-		if (ret)
-			break;
-
-		power_uw = (s64)voltage_uv * current_ua;
-		val->intval = (int)div_s64(power_uw < 0 ? -power_uw : power_uw,
-					   1000000);
-		break;
-	}
-	case POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN:
-		val->intval = chip->batt_info->voltage_min_design_uv;
-		break;
-	case POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN:
-		val->intval = chip->batt_info->voltage_max_design_uv;
-		break;
-	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
-		val->intval = chip->batt_info->charge_full_design_uah;
-		break;
-	case POWER_SUPPLY_PROP_CHARGE_FULL: {
-		s64 cap;
-
-		mutex_lock(&chip->state_lock);
-		cap = chip->learned_cap_uah;
-		mutex_unlock(&chip->state_lock);
-		val->intval = (int)cap;
-		break;
-	}
-	case POWER_SUPPLY_PROP_CHARGE_NOW: {
-		s64 cap;
-		int soc;
-
-		mutex_lock(&chip->state_lock);
-		cap = chip->learned_cap_uah;
-		soc = chip->batt_soc;
-		mutex_unlock(&chip->state_lock);
-		val->intval = (int)div_s64(cap * soc, 100);
-		break;
-	}
-	case POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN: {
-		s64 nom;
-		int v;
-
-		mutex_lock(&chip->state_lock);
-		nom = chip->nom_cap_uah;
-		v = chip->nom_voltage_uv;
-		mutex_unlock(&chip->state_lock);
-		val->intval = (int)div_s64(nom * v, 1000000);
-		break;
-	}
-	case POWER_SUPPLY_PROP_ENERGY_FULL: {
-		s64 cap;
-		int v;
-
-		mutex_lock(&chip->state_lock);
-		cap = chip->learned_cap_uah;
-		v = chip->nom_voltage_uv;
-		mutex_unlock(&chip->state_lock);
-		val->intval = (int)div_s64(cap * v, 1000000);
-		break;
-	}
-	case POWER_SUPPLY_PROP_ENERGY_NOW: {
-		s64 cap;
-		int soc, v;
-
-		mutex_lock(&chip->state_lock);
-		cap = chip->learned_cap_uah;
-		soc = chip->batt_soc;
-		v = chip->nom_voltage_uv;
-		mutex_unlock(&chip->state_lock);
-		val->intval = (int)div_s64(soc * cap * v, 100 * 1000000);
-		break;
-	}
-	case POWER_SUPPLY_PROP_CYCLE_COUNT:
-		ret = qcom_fg_get_cycle_count(chip, &val->intval);
-		break;
-	case POWER_SUPPLY_PROP_HEALTH: {
-		int batt_temp;
-
-		ret = qcom_fg_get_temperature(chip, &batt_temp);
-		if (ret)
-			break;
-
-		if (batt_temp < BATT_TEMP_JEITA_COLD)
-			val->intval = POWER_SUPPLY_HEALTH_COLD;
-		else if (batt_temp > BATT_TEMP_JEITA_HOT)
-			val->intval = POWER_SUPPLY_HEALTH_OVERHEAT;
-		else
-			val->intval = POWER_SUPPLY_HEALTH_GOOD;
-		break;
-	}
-	case POWER_SUPPLY_PROP_PRESENT:
-		val->intval = 1;
-		break;
-	case POWER_SUPPLY_PROP_TEMP:
-		ret = qcom_fg_get_temperature(chip, &val->intval);
-		break;
-	case POWER_SUPPLY_PROP_SCOPE:
-		val->intval = POWER_SUPPLY_SCOPE_SYSTEM;
-		break;
-	case POWER_SUPPLY_PROP_MANUFACTURER:
-		val->strval = chip->manufacturer;
-		break;
-	case POWER_SUPPLY_PROP_MODEL_NAME:
-		val->strval = chip->model_name;
-		break;
-	default:
-		return -EINVAL;
+	batt_np = of_parse_phandle(node, "monitored-battery", 0);
+	if (!batt_np) {
+		dev_err(dev, "No monitored-battery phandle\n");
+		return -ENODEV;
 	}
 
-	return ret;
+	info = devm_kzalloc(dev, sizeof(*info), GFP_KERNEL);
+	if (!info) {
+		of_node_put(batt_np);
+		return -ENOMEM;
+	}
+
+	info->voltage_min_design_uv = 3400000;
+	info->voltage_max_design_uv = 4480000;
+	info->charge_full_design_uah = 8720000;
+
+	if (!of_property_read_u32(batt_np, "voltage-min-design-microvolt",
+				  &val))
+		info->voltage_min_design_uv = (int)val;
+	if (!of_property_read_u32(batt_np, "voltage-max-design-microvolt",
+				  &val))
+		info->voltage_max_design_uv = (int)val;
+	if (!of_property_read_u32(batt_np, "charge-full-design-microamp-hours",
+				  &val))
+		info->charge_full_design_uah = (int)val;
+
+	chip->batt_info = info;
+	of_node_put(batt_np);
+
+	return 0;
 }
 
-static int qcom_fg_set_property(struct power_supply *psy,
-				enum power_supply_property psp,
-				const union power_supply_propval *val)
+static int qcom_fg_op_capacity(void *priv, int *val)
 {
-	struct qcom_fg_chip *chip = power_supply_get_drvdata(psy);
+	return qcom_fg_get_capacity(priv, val);
+}
+
+static int qcom_fg_op_capacity_level(void *priv, int *val)
+{
+	struct qcom_fg_chip *chip = priv;
+	int soc;
+
+	mutex_lock(&chip->state_lock);
+	soc = chip->batt_soc;
+	mutex_unlock(&chip->state_lock);
+
+	if (soc >= 100)
+		*val = POWER_SUPPLY_CAPACITY_LEVEL_FULL;
+	else if (soc >= 90)
+		*val = POWER_SUPPLY_CAPACITY_LEVEL_HIGH;
+	else if (soc >= 20)
+		*val = POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
+	else if (soc >= 5)
+		*val = POWER_SUPPLY_CAPACITY_LEVEL_LOW;
+	else if (soc > 0)
+		*val = POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL;
+	else
+		*val = POWER_SUPPLY_CAPACITY_LEVEL_UNKNOWN;
+	return 0;
+}
+
+static int qcom_fg_op_current(void *priv, int *val)
+{
+	return qcom_fg_get_current(priv, val);
+}
+
+static int qcom_fg_op_voltage(void *priv, int *val)
+{
+	return qcom_fg_get_voltage(priv, val);
+}
+
+static int qcom_fg_op_power(void *priv, int *val)
+{
+	struct qcom_fg_chip *chip = priv;
+	int voltage_uv, current_ua;
+	s64 power_uw;
 	int ret;
 
-	switch (psp) {
-	case POWER_SUPPLY_PROP_CHARGE_FULL: {
-		s64 new_cap;
+	ret = qcom_fg_get_voltage(chip, &voltage_uv);
+	if (ret)
+		return ret;
+	ret = qcom_fg_get_current(chip, &current_ua);
+	if (ret)
+		return ret;
 
-		if (val->intval <= 0)
-			return -EINVAL;
-
-		mutex_lock(&chip->cl_lock);
-		ret = qcom_fg_store_learned_capacity(chip, val->intval);
-		mutex_unlock(&chip->cl_lock);
-		if (ret)
-			return ret;
-
-		new_cap = val->intval;
-		mutex_lock(&chip->state_lock);
-		chip->learned_cap_uah = new_cap;
-		mutex_unlock(&chip->state_lock);
-		power_supply_changed(chip->batt_psy);
-		return 0;
-	}
-	default:
-		return -EINVAL;
-	}
+	power_uw = (s64)voltage_uv * current_ua;
+	*val = (int)div_s64(power_uw, 1000000);
+	return 0;
 }
 
-static const struct power_supply_desc batt_psy_desc = {
-	.name = "qcom-battery",
-	.type = POWER_SUPPLY_TYPE_BATTERY,
-	.properties = qcom_fg_props,
-	.num_properties = ARRAY_SIZE(qcom_fg_props),
-	.get_property = qcom_fg_get_property,
-	.set_property = qcom_fg_set_property,
-};
+static int qcom_fg_op_voltage_min_design(void *priv, int *val)
+{
+	struct qcom_fg_chip *chip = priv;
 
-/* INIT FUNCTIONS */
+	*val = chip->batt_info->voltage_min_design_uv;
+	return 0;
+}
+
+static int qcom_fg_op_voltage_max_design(void *priv, int *val)
+{
+	struct qcom_fg_chip *chip = priv;
+
+	*val = chip->batt_info->voltage_max_design_uv;
+	return 0;
+}
+
+static int qcom_fg_op_charge_full_design(void *priv, int *val)
+{
+	struct qcom_fg_chip *chip = priv;
+
+	*val = chip->batt_info->charge_full_design_uah;
+	return 0;
+}
+
+static int qcom_fg_op_charge_full(void *priv, int *val)
+{
+	struct qcom_fg_chip *chip = priv;
+
+	mutex_lock(&chip->state_lock);
+	*val = (int)chip->learned_cap_uah;
+	mutex_unlock(&chip->state_lock);
+	return 0;
+}
+
+static int qcom_fg_op_charge_now(void *priv, int *val)
+{
+	struct qcom_fg_chip *chip = priv;
+	s64 cap;
+	int soc;
+
+	mutex_lock(&chip->state_lock);
+	cap = chip->learned_cap_uah;
+	soc = chip->batt_soc;
+	mutex_unlock(&chip->state_lock);
+
+	*val = (int)div_s64(cap * soc, 100);
+	return 0;
+}
+
+static int qcom_fg_op_energy_full_design(void *priv, int *val)
+{
+	struct qcom_fg_chip *chip = priv;
+	s64 nom;
+	int v;
+
+	mutex_lock(&chip->state_lock);
+	nom = chip->nom_cap_uah;
+	v = chip->nom_voltage_uv;
+	mutex_unlock(&chip->state_lock);
+
+	*val = (int)div_s64(nom * v, 1000000);
+	return 0;
+}
+
+static int qcom_fg_op_energy_full(void *priv, int *val)
+{
+	struct qcom_fg_chip *chip = priv;
+	s64 cap;
+	int v;
+
+	mutex_lock(&chip->state_lock);
+	cap = chip->learned_cap_uah;
+	v = chip->nom_voltage_uv;
+	mutex_unlock(&chip->state_lock);
+
+	*val = (int)div_s64(cap * v, 1000000);
+	return 0;
+}
+
+static int qcom_fg_op_energy_now(void *priv, int *val)
+{
+	struct qcom_fg_chip *chip = priv;
+	s64 cap;
+	int soc, v;
+
+	mutex_lock(&chip->state_lock);
+	cap = chip->learned_cap_uah;
+	soc = chip->batt_soc;
+	v = chip->nom_voltage_uv;
+	mutex_unlock(&chip->state_lock);
+
+	*val = (int)div_s64(soc * cap * v, 100 * 1000000);
+	return 0;
+}
+
+static int qcom_fg_op_cycle_count(void *priv, int *val)
+{
+	return qcom_fg_get_cycle_count(priv, val);
+}
+
+static int qcom_fg_op_health(void *priv, int *val)
+{
+	struct qcom_fg_chip *chip = priv;
+	int batt_temp;
+	int ret;
+
+	ret = qcom_fg_get_temperature(chip, &batt_temp);
+	if (ret)
+		return ret;
+
+	if (batt_temp < BATT_TEMP_JEITA_COLD)
+		*val = POWER_SUPPLY_HEALTH_COLD;
+	else if (batt_temp > BATT_TEMP_JEITA_HOT)
+		*val = POWER_SUPPLY_HEALTH_OVERHEAT;
+	else
+		*val = POWER_SUPPLY_HEALTH_GOOD;
+	return 0;
+}
+
+static int qcom_fg_op_present(void *priv, int *val)
+{
+	*val = 1;
+	return 0;
+}
+
+static int qcom_fg_op_temp(void *priv, int *val)
+{
+	return qcom_fg_get_temperature(priv, val);
+}
+
+static int qcom_fg_op_scope(void *priv, int *val)
+{
+	*val = POWER_SUPPLY_SCOPE_SYSTEM;
+	return 0;
+}
+
+static int qcom_fg_op_technology(void *priv, int *val)
+{
+	*val = POWER_SUPPLY_TECHNOLOGY_LION;
+	return 0;
+}
+
+static int qcom_fg_op_manufacturer(void *priv, const char **name)
+{
+	struct qcom_fg_chip *chip = priv;
+
+	*name = chip->manufacturer;
+	return 0;
+}
+
+static int qcom_fg_op_model_name(void *priv, const char **name)
+{
+	struct qcom_fg_chip *chip = priv;
+
+	*name = chip->model_name;
+	return 0;
+}
+
+static int qcom_fg_op_set_charge_full(void *priv, int uah)
+{
+	struct qcom_fg_chip *chip = priv;
+	int ret;
+
+	if (uah <= 0)
+		return -EINVAL;
+
+	mutex_lock(&chip->cl_lock);
+	ret = qcom_fg_store_learned_capacity(chip, uah);
+	mutex_unlock(&chip->cl_lock);
+	if (ret)
+		return ret;
+
+	mutex_lock(&chip->state_lock);
+	chip->learned_cap_uah = uah;
+	mutex_unlock(&chip->state_lock);
+
+	qcom_bms_notify_changed(chip->dev);
+	return 0;
+}
+
+static void qcom_fg_charging_state_changed(void *priv, int status,
+					   bool charge_done, bool input_present)
+{
+	struct qcom_fg_chip *chip = priv;
+
+	mutex_lock(&chip->state_lock);
+	chip->status = status;
+	chip->charge_done = charge_done;
+	chip->input_present = input_present;
+	mutex_unlock(&chip->state_lock);
+
+	qcom_fg_algorithms_update(chip);
+}
+
+static const struct qcom_bms_fg_ops qcom_fg_ops = {
+	.get_capacity = qcom_fg_op_capacity,
+	.get_capacity_level = qcom_fg_op_capacity_level,
+	.get_current = qcom_fg_op_current,
+	.get_voltage = qcom_fg_op_voltage,
+	.get_power = qcom_fg_op_power,
+	.get_voltage_min_design = qcom_fg_op_voltage_min_design,
+	.get_voltage_max_design = qcom_fg_op_voltage_max_design,
+	.get_charge_full_design = qcom_fg_op_charge_full_design,
+	.get_charge_full = qcom_fg_op_charge_full,
+	.get_charge_now = qcom_fg_op_charge_now,
+	.get_energy_full_design = qcom_fg_op_energy_full_design,
+	.get_energy_full = qcom_fg_op_energy_full,
+	.get_energy_now = qcom_fg_op_energy_now,
+	.get_cycle_count = qcom_fg_op_cycle_count,
+	.get_health = qcom_fg_op_health,
+	.get_present = qcom_fg_op_present,
+	.get_temp = qcom_fg_op_temp,
+	.get_scope = qcom_fg_op_scope,
+	.get_technology = qcom_fg_op_technology,
+	.get_manufacturer = qcom_fg_op_manufacturer,
+	.get_model_name = qcom_fg_op_model_name,
+	.set_charge_full = qcom_fg_op_set_charge_full,
+	.charging_state_changed = qcom_fg_charging_state_changed,
+};
 
 static void qcom_fg_read_state(struct qcom_fg_chip *chip)
 {
@@ -984,39 +1516,9 @@ static irqreturn_t qcom_fg_handle_soc_delta(int irq, void *data)
 	struct qcom_fg_chip *chip = data;
 
 	qcom_fg_read_state(chip);
-	qcom_fg_cap_learning_update(chip);
-	power_supply_changed(chip->batt_psy);
+	qcom_fg_algorithms_update(chip);
+	qcom_bms_notify_changed(chip->dev);
 	return IRQ_HANDLED;
-}
-
-static void qcom_fg_status_changed(struct qcom_fg_chip *chip)
-{
-	union power_supply_propval propval;
-	int status;
-
-	if (power_supply_get_property(chip->chg_psy, POWER_SUPPLY_PROP_STATUS,
-				      &propval))
-		status = POWER_SUPPLY_STATUS_UNKNOWN;
-	else
-		status = propval.intval;
-
-	mutex_lock(&chip->state_lock);
-	chip->status = status;
-	mutex_unlock(&chip->state_lock);
-
-	power_supply_changed(chip->batt_psy);
-}
-
-static int qcom_fg_notifier_call(struct notifier_block *nb, unsigned long val,
-				 void *v)
-{
-	struct qcom_fg_chip *chip = container_of(nb, struct qcom_fg_chip, nb);
-	struct power_supply *psy = v;
-
-	if (psy == chip->chg_psy)
-		qcom_fg_status_changed(chip);
-
-	return NOTIFY_OK;
 }
 
 static int qcom_fg_load_profile(struct qcom_fg_chip *chip)
@@ -1126,13 +1628,13 @@ static const struct fg_u32_param fg_u32_params[] = {
 	  KI_COEFF_MED_HI_CHG_THR_OFFSET, 1, fg_encode_ki_coeff_thresh },
 };
 
-/* DT array [init, max]; SRAM layout byte0=max, byte1=init. */
+/*
+ * DT array [init, max]; SRAM layout byte0=max, byte1=init.
+ */
 static const struct {
 	const char *prop;
 	u16 word;
 } fg_esr_timers[] = {
-	{ "qcom,fg-esr-timer-chg-fast", ESR_TIMER_FAST_CHG_WORD },
-	{ "qcom,fg-esr-timer-dischg-fast", ESR_TIMER_FAST_DISCHG_WORD },
 	{ "qcom,fg-esr-timer-chg-slow", ESR_TIMER_CHG_WORD },
 	{ "qcom,fg-esr-timer-dischg-slow", ESR_TIMER_DISCHG_WORD },
 };
@@ -1141,7 +1643,7 @@ static int qcom_fg_write_u32_param(struct qcom_fg_chip *chip,
 				   struct device_node *node,
 				   const struct fg_u32_param *p)
 {
-	int val;
+	u32 val;
 	u8 buf[2];
 
 	if (of_property_read_u32(node, p->prop, &val))
@@ -1208,6 +1710,7 @@ static int qcom_fg_init_capacity_learning(struct qcom_fg_chip *chip,
 					  struct device_node *node)
 {
 	s64 nom_cap = 0, learned_cap;
+	bool store_learned = false;
 	int nom_cap_mah;
 	u8 buf[2];
 	int ret;
@@ -1244,11 +1747,25 @@ static int qcom_fg_init_capacity_learning(struct qcom_fg_chip *chip,
 	mutex_lock(&chip->cl_lock);
 	ret = qcom_fg_get_learned_capacity(chip, &learned_cap);
 	if (ret || learned_cap <= 0) {
-		ret = qcom_fg_store_learned_capacity(chip, nom_cap);
-		if (ret)
-			dev_warn(chip->dev, "Failed to init ACT_BATT_CAP: %d\n",
-				 ret);
 		learned_cap = nom_cap;
+		store_learned = true;
+	} else if ((learned_cap > nom_cap ?
+			    learned_cap - nom_cap :
+			    nom_cap - learned_cap) > nom_cap / 2) {
+		dev_warn(
+			chip->dev,
+			"Learned capacity %lld uAh is outside 50%% of nominal; resetting to %lld uAh\n",
+			learned_cap, nom_cap);
+		learned_cap = nom_cap;
+		store_learned = true;
+	}
+
+	if (store_learned) {
+		ret = qcom_fg_store_learned_capacity(chip, learned_cap);
+		if (ret)
+			dev_warn(chip->dev,
+				 "Failed to initialize learned capacity: %d\n",
+				 ret);
 	}
 	mutex_unlock(&chip->cl_lock);
 
@@ -1288,6 +1805,19 @@ static int qcom_fg_init_capacity_learning(struct qcom_fg_chip *chip,
 				 &chip->cl_max_cap_dec))
 		chip->cl_max_cap_dec = 100;
 
+	if (of_property_read_u32(node, "qcom,cl-min-temp", &chip->cl_min_temp))
+		chip->cl_min_temp = DEFAULT_CL_MIN_TEMP_DECIDEGC;
+	if (of_property_read_u32(node, "qcom,cl-max-temp", &chip->cl_max_temp))
+		chip->cl_max_temp = DEFAULT_CL_MAX_TEMP_DECIDEGC;
+	if (chip->cl_min_temp > chip->cl_max_temp) {
+		dev_warn(
+			chip->dev,
+			"Invalid capacity-learning temperature range %d..%d; using defaults\n",
+			chip->cl_min_temp, chip->cl_max_temp);
+		chip->cl_min_temp = DEFAULT_CL_MIN_TEMP_DECIDEGC;
+		chip->cl_max_temp = DEFAULT_CL_MAX_TEMP_DECIDEGC;
+	}
+
 	if (chip->cl_max_cap_dec > 1000) {
 		dev_warn(chip->dev,
 			 "cl-max-decrement %d exceeds 1000%%, clamping\n",
@@ -1309,12 +1839,9 @@ static int qcom_fg_init_capacity_learning(struct qcom_fg_chip *chip,
 
 static int qcom_fg_probe(struct platform_device *pdev)
 {
-	struct power_supply_config supply_config = {};
 	struct qcom_fg_chip *chip;
 	const __be32 *prop_addr;
 	int irq;
-	u8 dma_status;
-	bool error_present;
 	int ret;
 
 	chip = devm_kzalloc(&pdev->dev, sizeof(*chip), GFP_KERNEL);
@@ -1326,7 +1853,10 @@ static int qcom_fg_probe(struct platform_device *pdev)
 	init_completion(&chip->mem_attn_done);
 	mutex_init(&chip->dma_lock);
 	mutex_init(&chip->cl_lock);
+	mutex_init(&chip->cycle_lock);
 	mutex_init(&chip->state_lock);
+	chip->cycle_last_bucket = -1;
+	chip->status = POWER_SUPPLY_STATUS_UNKNOWN;
 
 	chip->regmap = dev_get_regmap(pdev->dev.parent, NULL);
 	if (!chip->regmap) {
@@ -1341,17 +1871,16 @@ static int qcom_fg_probe(struct platform_device *pdev)
 	}
 	chip->base = be32_to_cpu(*prop_addr);
 
-	ret = qcom_fg_read(chip, &dma_status, MEM_IF_DMA_STS, 1);
-	if (ret < 0) {
-		dev_err(chip->dev, "Failed to read dma_status: %d\n", ret);
-		return ret;
+	if (of_find_property(pdev->dev.of_node, "nvmem", NULL)) {
+		chip->nvmem = devm_nvmem_device_get(chip->dev, "fg_sdam");
+		if (IS_ERR(chip->nvmem))
+			return dev_err_probe(chip->dev, PTR_ERR(chip->nvmem),
+					     "Failed to get FG SDAM\n");
 	}
 
-	error_present = dma_status & (BIT(1) | BIT(2));
-	ret = qcom_fg_masked_write(chip, MEM_IF_DMA_CTL, BIT(0),
-				   error_present ? BIT(0) : 0);
+	ret = qcom_fg_clear_dma_errors(chip);
 	if (ret < 0) {
-		dev_err(chip->dev, "Failed to write dma_ctl: %d\n", ret);
+		dev_err(chip->dev, "Failed to clear DMA errors: %d\n", ret);
 		return ret;
 	}
 
@@ -1361,24 +1890,13 @@ static int qcom_fg_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	supply_config.drv_data = chip;
-
-	chip->batt_psy = devm_power_supply_register(chip->dev, &batt_psy_desc,
-						    &supply_config);
-	if (IS_ERR(chip->batt_psy)) {
-		if (PTR_ERR(chip->batt_psy) != -EPROBE_DEFER)
-			dev_err(&pdev->dev, "Failed to register battery\n");
-		return PTR_ERR(chip->batt_psy);
-	}
-
 	platform_set_drvdata(pdev, chip);
 
-	ret = power_supply_get_battery_info(chip->batt_psy, &chip->batt_info);
+	ret = qcom_fg_parse_battery_info(chip);
 	if (ret) {
-		dev_err(&pdev->dev, "Failed to get battery info: %d\n", ret);
+		dev_err(&pdev->dev, "Failed to parse battery info: %d\n", ret);
 		return ret;
 	}
-	/* From this point, error paths must call power_supply_put_battery_info() */
 
 	ret = qcom_fg_load_profile(chip);
 	if (ret)
@@ -1392,13 +1910,18 @@ static int qcom_fg_probe(struct platform_device *pdev)
 
 	ret = qcom_fg_init_capacity_learning(chip, pdev->dev.of_node);
 	if (ret)
-		goto err_put_info;
+		return ret;
+
+	ret = qcom_fg_restore_cycle_count(chip);
+	if (ret)
+		dev_warn(chip->dev, "Failed to initialize cycle count: %d\n",
+			 ret);
 
 	irq = platform_get_irq_byname(pdev, "soc-delta");
 	if (irq < 0) {
 		dev_err(&pdev->dev, "Failed to get soc-delta IRQ: %d\n", irq);
 		ret = irq;
-		goto err_put_info;
+		return ret;
 	}
 
 	ret = devm_request_threaded_irq(chip->dev, irq, NULL,
@@ -1407,14 +1930,14 @@ static int qcom_fg_probe(struct platform_device *pdev)
 	if (ret < 0) {
 		dev_err(&pdev->dev, "Failed to request soc-delta IRQ: %d\n",
 			ret);
-		goto err_put_info;
+		return ret;
 	}
 
 	irq = platform_get_irq_byname(pdev, "mem-attn");
 	if (irq <= 0) {
 		dev_err(&pdev->dev, "Failed to get mem-attn IRQ: %d\n", irq);
 		ret = irq ?: -ENXIO;
-		goto err_put_info;
+		return ret;
 	}
 
 	ret = devm_request_threaded_irq(chip->dev, irq, NULL,
@@ -1423,46 +1946,35 @@ static int qcom_fg_probe(struct platform_device *pdev)
 	if (ret < 0) {
 		dev_err(&pdev->dev, "Failed to request mem-attn IRQ: %d\n",
 			ret);
-		goto err_put_info;
+		return ret;
 	}
 
-	chip->chg_psy = power_supply_get_by_reference(dev_fwnode(chip->dev),
-						      "power-supplies");
-	if (chip->chg_psy == ERR_PTR(-EPROBE_DEFER)) {
-		dev_dbg(chip->dev,
-			"Charger supply not ready, deferring probe\n");
-		ret = -EPROBE_DEFER;
-		goto err_put_info;
-	}
-	if (IS_ERR(chip->chg_psy)) {
-		ret = PTR_ERR(chip->chg_psy);
-		dev_err(chip->dev, "Failed to get charger supply: %d\n", ret);
-		chip->chg_psy = NULL;
-		goto err_put_info;
-	}
-	if (!chip->chg_psy) {
-		dev_err(chip->dev, "Charger supply not found\n");
-		ret = -ENODEV;
-		goto err_put_info;
+	irq = platform_get_irq_byname(pdev, "ima-xcp");
+	if (irq > 0) {
+		ret = devm_request_threaded_irq(chip->dev, irq, NULL,
+						qcom_fg_mem_xcp_irq_handler,
+						IRQF_ONESHOT, "ima-xcp", chip);
+		if (ret < 0) {
+			dev_err(&pdev->dev,
+				"Failed to request ima-xcp IRQ: %d\n", ret);
+			return ret;
+		}
+	} else if (irq != -ENXIO) {
+		dev_err(&pdev->dev, "Failed to get ima-xcp IRQ: %d\n", irq);
+		ret = irq;
+		return ret;
 	}
 
-	chip->nb.notifier_call = qcom_fg_notifier_call;
-	ret = power_supply_reg_notifier(&chip->nb);
+	ret = qcom_bms_register_fg(&pdev->dev, &qcom_fg_ops, chip);
 	if (ret) {
-		dev_err(chip->dev, "Failed to register notifier: %d\n", ret);
-		goto err_put_chg_psy;
+		dev_err(chip->dev, "Failed to register with qcom_bms: %d\n",
+			ret);
+		return ret;
 	}
 
-	qcom_fg_status_changed(chip);
 	qcom_fg_read_state(chip);
 
 	return 0;
-
-err_put_chg_psy:
-	power_supply_put(chip->chg_psy);
-err_put_info:
-	power_supply_put_battery_info(chip->batt_psy, chip->batt_info);
-	return ret;
 }
 
 static int __maybe_unused qcom_fg_resume(struct device *dev)
@@ -1470,23 +1982,36 @@ static int __maybe_unused qcom_fg_resume(struct device *dev)
 	struct qcom_fg_chip *chip = dev_get_drvdata(dev);
 
 	qcom_fg_read_state(chip);
-
-	qcom_fg_cap_learning_update(chip);
-
-	power_supply_changed(chip->batt_psy);
+	qcom_fg_algorithms_update(chip);
+	qcom_bms_notify_changed(chip->dev);
 
 	return 0;
 }
 
 static SIMPLE_DEV_PM_OPS(qcom_fg_pm_ops, NULL, qcom_fg_resume);
 
-static void qcom_fg_remove(struct platform_device *pdev)
+static void qcom_fg_shutdown(struct platform_device *pdev)
 {
 	struct qcom_fg_chip *chip = platform_get_drvdata(pdev);
+	bool input_present;
+	u8 batt_soc_raw;
 
-	power_supply_unreg_notifier(&chip->nb);
-	power_supply_put(chip->chg_psy);
-	power_supply_put_battery_info(chip->batt_psy, chip->batt_info);
+	if (qcom_fg_get_batt_soc(chip, NULL, &batt_soc_raw))
+		return;
+
+	mutex_lock(&chip->state_lock);
+	input_present = chip->input_present;
+	mutex_unlock(&chip->state_lock);
+
+	/* Treat shutdown as the end of the current charge-throughput sample. */
+	qcom_fg_cycle_count_update(chip, batt_soc_raw,
+				   POWER_SUPPLY_STATUS_NOT_CHARGING, true,
+				   input_present);
+}
+
+static void qcom_fg_remove(struct platform_device *pdev)
+{
+	qcom_bms_unregister_fg(&pdev->dev);
 }
 
 static const struct of_device_id fg_match_id_table[] = {
@@ -1498,6 +2023,7 @@ MODULE_DEVICE_TABLE(of, fg_match_id_table);
 static struct platform_driver qcom_fg_driver = {
 	.probe = qcom_fg_probe,
 	.remove = qcom_fg_remove,
+	.shutdown = qcom_fg_shutdown,
 	.driver = {
 		.name = "qcom-fg",
 		.of_match_table = fg_match_id_table,

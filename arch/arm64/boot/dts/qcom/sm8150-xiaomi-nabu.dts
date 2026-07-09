@@ -128,6 +128,34 @@
 		energy-full-design-microwatt-hours = <33600000>;
 		voltage-min-design-microvolt = <3400000>;
 		voltage-max-design-microvolt = <4480000>;
+		constant-charge-current-max-microamp = <3000000>;
+		constant-charge-voltage-max-microvolt = <4480000>;
+	};
+
+	qcom_bms: battery-manager {
+		compatible = "qcom,pm8150b-bms";
+		qcom,required-authenticators = <3>;
+		status = "okay";
+	};
+
+	battery-auth-primary {
+		compatible = "maxim,ds28e16-xiaomi";
+		gpios = <&tlmm 5 GPIO_ACTIVE_HIGH>;
+		maxim,auth-role = "primary";
+		maxim,gpio-config-address = <0x03d05000>;
+		maxim,gpio-io-offset = <0x4>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&ds28e16_primary_default>;
+	};
+
+	battery-auth-secondary {
+		compatible = "maxim,ds28e16-xiaomi";
+		gpios = <&tlmm 10 GPIO_ACTIVE_HIGH>;
+		maxim,auth-role = "secondary";
+		maxim,gpio-config-address = <0x0390a000>;
+		maxim,gpio-io-offset = <0x4>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&ds28e16_secondary_default>;
 	};
 
 	xiaomi_keyboard {
@@ -512,6 +540,27 @@
 			};
 		};
 	};
+
+	ln8000_charger: charger@51 {
+		compatible = "lionsemi,ln8000";
+		reg = <0x51>;
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <55 IRQ_TYPE_LEVEL_LOW>;
+
+		/* Sunwoda 8720mAh battery profile */
+		lionsemi,bat-ovp-threshold-microvolt = <4560000>;
+		lionsemi,bus-ovp-threshold-microvolt = <13000000>;
+		lionsemi,bus-ocp-threshold-microamp = <3750000>;
+		lionsemi,ntc-alarm-cfg = <226>;
+
+		/* NTC/die monitoring handled by the PMIC fuel gauge */
+		lionsemi,tbus-mon-disable;
+		lionsemi,tbat-mon-disable;
+		lionsemi,iin-ocp-disable;
+		lionsemi,iin-reg-disable;
+		lionsemi,vbat-reg-disable;
+	};
 };
 
 &i2c7 {
@@ -669,8 +718,8 @@
 &pm8150b_fg {
 	status = "okay";
 	monitored-battery = <&battery>;
-	power-supplies = <&pm8150b_charger>;
-	//power-supplies = <&ln8000_charger>;
+	nvmem = <&pm8150_sdam_2>;
+	nvmem-names = "fg_sdam";
 
 	/* Battery profile data for Sunwoda 8720mAh battery */
 	qcom,fg-profile-data = [
@@ -835,9 +884,14 @@
 		sink-pdos = <PDO_FIXED(5000, 3000,
 					 PDO_FIXED_DUAL_ROLE |
 					 PDO_FIXED_USB_COMM |
-					 PDO_FIXED_DATA_SWAP)>;
+					 PDO_FIXED_DATA_SWAP)
+			     PDO_FIXED(9000, 3000,
+					 PDO_FIXED_DUAL_ROLE |
+					 PDO_FIXED_USB_COMM |
+					 PDO_FIXED_DATA_SWAP)
+			     PDO_PPS_APDO(5000, 12000, 3000)>;
 
-		op-sink-microwatt = <10000000>;
+		op-sink-microwatt = <33000000>;
 
 		ports {
 			#address-cells = <1>;
@@ -1022,6 +1076,20 @@
 
 &tlmm {
 	gpio-reserved-ranges = <126 4>;
+
+	ds28e16_primary_default: ds28e16-primary-default-state {
+		pins = "gpio5";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+
+	ds28e16_secondary_default: ds28e16-secondary-default-state {
+		pins = "gpio10";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
 
 	quat_tdm_active: quat-tdm-active-state {
 		pins = "gpio137", "gpio138";
