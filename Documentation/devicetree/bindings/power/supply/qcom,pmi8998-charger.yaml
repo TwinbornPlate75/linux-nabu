@@ -12,6 +12,8 @@ maintainers:
 properties:
   compatible:
     enum:
+      - qcom,pm7250b-charger
+      - qcom,pm8150b-charger
       - qcom,pmi8998-charger
       - qcom,pm660-charger
 
@@ -19,7 +21,7 @@ properties:
     maxItems: 1
 
   interrupts:
-    maxItems: 4
+    maxItems: 6
 
   interrupt-names:
     items:
@@ -27,6 +29,8 @@ properties:
       - const: bat-ov
       - const: wdog-bark
       - const: usbin-icl-change
+      - const: chg-state-change
+      - const: usbin-src-change
 
   io-channels:
     items:
@@ -39,6 +43,12 @@ properties:
       - const: usbin_v
 
   monitored-battery: true
+
+  qcom,auto-recharge-soc:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 0
+    maximum: 100
+    description: State of charge percentage at which charging restarts.
 
 required:
   - compatible
