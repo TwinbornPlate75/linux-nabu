@@ -15,16 +15,20 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/power_supply.h>
-#include <linux/slab.h>
 #include <linux/workqueue.h>
 
 #include "qcom_bms.h"
 
 #define QCOM_BMS_PSY_NAME "qcom-battery"
 #define QCOM_BMS_USB_PSY_NAME "qcom-usb"
+
+/* Direct charge is deferred to PMIC USBIN precharge below this VBAT (uV). */
+#define QCOM_BMS_DC_MIN_VBAT_UV 3500000
 
 struct qcom_bms_fg {
 	struct device *dev;
@@ -77,7 +81,13 @@ struct qcom_bms_info {
 	u32 required_auth_mask;
 	bool authenticated;
 
-	struct delayed_work status_work;
+	struct work_struct status_work;
+
+	/* tcpm source psy (CC-driven attach/detach) drives direct-charge control. */
+	struct notifier_block psy_nb;
+	struct power_supply *tcpm_psy;
+	struct device_node *tcpm_np;
+	bool pmic_usbin_suspended;
 
 	int status;
 	bool charge_done;
@@ -601,12 +611,143 @@ static void qcom_bms_update_status(struct qcom_bms_info *info)
 	}
 }
 
+/* tcpm source psy changed (CC attach/detach) -> re-evaluate direct charge. */
+static int qcom_bms_psy_notifier(struct notifier_block *nb, unsigned long event,
+				 void *data)
+{
+	struct qcom_bms_info *info =
+		container_of(nb, struct qcom_bms_info, psy_nb);
+	struct power_supply *psy = data;
+
+	if (event == PSY_EVENT_PROP_CHANGED && info->tcpm_np &&
+	    psy->dev.of_node == info->tcpm_np)
+		queue_work(system_freezable_wq, &info->status_work);
+
+	return NOTIFY_OK;
+}
+
+/*
+ * Decide whether the direct charger should be enabled.  The coordinator owns
+ * this decision (driven by the real charger connection state from the tcpm CC
+ * psy); the LN8000 only self-disables on a hardware fault / I2C error.  This is
+ * the complement of qcom_bms_update_status(): that aggregates state, this acts
+ * on it.
+ */
+static void qcom_bms_evaluate_direct_charge(struct qcom_bms_info *info)
+{
+	struct qcom_bms_charger_ref direct = {};
+	struct qcom_bms_charger_ref pmic = {};
+	struct qcom_bms_fg_ref fg = {};
+	union power_supply_propval val;
+	bool have_direct, have_pmic, have_fg;
+	bool direct_online = false;
+	bool cc_online = false;
+	bool want_on;
+	int health = POWER_SUPPLY_HEALTH_GOOD;
+	int vbat_uv = QCOM_BMS_DC_MIN_VBAT_UV;
+	int online;
+	int ret;
+
+	/* Resolve the tcpm source psy lazily (tcpm may probe after us). */
+	if (!info->tcpm_psy && info->tcpm_np) {
+		info->tcpm_psy = power_supply_get_by_reference(
+			dev_fwnode(info->dev), "qcom,tcpm-psy");
+		if (IS_ERR(info->tcpm_psy))
+			info->tcpm_psy = NULL;
+	}
+	/* tcpm not probed yet; the psy notifier re-triggers us when it
+	 * registers.  cc_online stays false (safe).
+	 */
+	if (!info->tcpm_psy)
+		return;
+
+	mutex_lock(&info->ops_lock);
+	have_direct =
+		qcom_bms_charger_acquire_locked(&info->direct_chg, &direct);
+	have_pmic = qcom_bms_charger_acquire_locked(&info->pmic_chg, &pmic);
+	have_fg = qcom_bms_fg_acquire_locked(info, &fg);
+	mutex_unlock(&info->ops_lock);
+
+	if (!have_direct || !direct.ops->set_charging_enabled ||
+	    !direct.ops->get_online || !direct.ops->get_health)
+		goto out;
+
+	if (!direct.ops->get_online(direct.priv, &online))
+		direct_online = online;
+	direct.ops->get_health(direct.priv, &health);
+	if (have_fg && fg.ops->get_voltage)
+		fg.ops->get_voltage(fg.priv, &vbat_uv);
+
+	ret = power_supply_get_property(info->tcpm_psy,
+					POWER_SUPPLY_PROP_ONLINE, &val);
+	cc_online = !ret && val.intval;
+
+	want_on = cc_online && READ_ONCE(info->authenticated) &&
+		  health == POWER_SUPPLY_HEALTH_GOOD &&
+		  vbat_uv >= QCOM_BMS_DC_MIN_VBAT_UV;
+
+	if (want_on && !direct_online) {
+		ret = direct.ops->set_charging_enabled(direct.priv, true);
+		if (!ret)
+			dev_info(info->dev,
+				 "charger connected, enabling direct charge\n");
+		else if (ret != -EAGAIN)
+			dev_warn(info->dev,
+				 "failed to enable direct charge: %d\n", ret);
+	} else if (!want_on && direct_online) {
+		dev_info(
+			info->dev,
+			"charger disconnected or not ready, disabling direct charge\n");
+		ret = direct.ops->set_charging_enabled(direct.priv, false);
+		if (ret)
+			dev_warn(info->dev,
+				 "failed to disable direct charge: %d\n", ret);
+	}
+
+	/*
+	 * Re-read the actual direct-charge state (the LN8000 may have
+	 * self-disabled on a fault/RCP trip, or the enable may have been refused
+	 * during the cooldown).  The coordinator owns the PMIC USBIN handover:
+	 * suspend the PMIC USBIN path iff direct charge is actively online, so a
+	 * self-disable (or a refused enable) restores PMIC charging.
+	 */
+	if (direct.ops->get_online(direct.priv, &online))
+		direct_online = false;
+	else
+		direct_online = online;
+
+	if (have_pmic && pmic.ops->set_usbin_suspend) {
+		bool want_pmic_susp = direct_online;
+
+		if (want_pmic_susp != info->pmic_usbin_suspended) {
+			ret = pmic.ops->set_usbin_suspend(pmic.priv,
+							  want_pmic_susp);
+			if (ret)
+				dev_warn(info->dev,
+					 "failed to %s PMIC USBIN: %d\n",
+					 want_pmic_susp ? "suspend" : "resume",
+					 ret);
+			else
+				info->pmic_usbin_suspended = want_pmic_susp;
+		}
+	}
+
+out:
+	if (have_pmic)
+		qcom_bms_charger_release(info, &pmic);
+	if (have_direct)
+		qcom_bms_charger_release(info, &direct);
+	if (have_fg)
+		qcom_bms_fg_release(info, &fg);
+}
+
 static void qcom_bms_status_work(struct work_struct *work)
 {
 	struct qcom_bms_info *info =
-		container_of(work, struct qcom_bms_info, status_work.work);
+		container_of(work, struct qcom_bms_info, status_work);
 
 	qcom_bms_update_status(info);
+	qcom_bms_evaluate_direct_charge(info);
 }
 
 static void qcom_bms_refresh_authentication(struct qcom_bms_info *info)
@@ -668,6 +809,9 @@ static void qcom_bms_refresh_authentication(struct qcom_bms_info *info)
 		 authenticated ? "passed" : "failed", authenticated_mask,
 		 info->required_auth_mask);
 	power_supply_changed(info->bms_psy);
+
+	/* Authentication gates direct charge; re-evaluate on change. */
+	queue_work(system_freezable_wq, &info->status_work);
 }
 
 int qcom_bms_register_fg(struct device *dev, const struct qcom_bms_fg_ops *ops,
@@ -799,7 +943,7 @@ void qcom_bms_unregister_fg(struct device *dev)
 	info->fg.unregistering = false;
 	mutex_unlock(&info->ops_lock);
 
-	mod_delayed_work(system_wq, &info->status_work, 0);
+	queue_work(system_freezable_wq, &info->status_work);
 }
 EXPORT_SYMBOL_GPL(qcom_bms_unregister_fg);
 
@@ -838,7 +982,7 @@ void qcom_bms_unregister_charger(struct device *dev)
 	charger->unregistering = false;
 	mutex_unlock(&info->ops_lock);
 
-	mod_delayed_work(system_wq, &info->status_work, 0);
+	queue_work(system_freezable_wq, &info->status_work);
 }
 EXPORT_SYMBOL_GPL(qcom_bms_unregister_charger);
 
@@ -942,46 +1086,10 @@ void qcom_bms_notify_changed(struct device *dev)
 	registered = info->fg.dev == dev || info->pmic_chg.dev == dev ||
 		     info->direct_chg.dev == dev;
 	if (registered)
-		mod_delayed_work(system_wq, &info->status_work,
-				 msecs_to_jiffies(100));
+		queue_work(system_freezable_wq, &info->status_work);
 	mutex_unlock(&info->ops_lock);
 }
 EXPORT_SYMBOL_GPL(qcom_bms_notify_changed);
-
-int qcom_bms_set_pmic_usbin_suspend(struct device *dev, bool suspend)
-{
-	struct qcom_bms_charger_ref pmic = {};
-	struct qcom_bms_info *info;
-	int ret;
-
-	info = qcom_bms_lock();
-	if (!info)
-		return -ENODEV;
-
-	if (info->direct_chg.dev != dev) {
-		ret = -EPERM;
-		goto out_unlock;
-	}
-	if (!info->pmic_chg.ops || !info->pmic_chg.ops->set_usbin_suspend ||
-	    !qcom_bms_charger_acquire_locked(&info->pmic_chg, &pmic)) {
-		ret = -EOPNOTSUPP;
-		goto out_unlock;
-	}
-	mutex_unlock(&info->ops_lock);
-
-	ret = pmic.ops->set_usbin_suspend(pmic.priv, suspend);
-	qcom_bms_charger_release(info, &pmic);
-	if (!ret)
-		mod_delayed_work(system_wq, &info->status_work,
-				 msecs_to_jiffies(100));
-
-	return ret;
-
-out_unlock:
-	mutex_unlock(&info->ops_lock);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(qcom_bms_set_pmic_usbin_suspend);
 
 static int qcom_bms_probe(struct platform_device *pdev)
 {
@@ -1014,7 +1122,7 @@ static int qcom_bms_probe(struct platform_device *pdev)
 	complete_all(&info->pmic_chg.idle);
 	init_completion(&info->direct_chg.idle);
 	complete_all(&info->direct_chg.idle);
-	INIT_DELAYED_WORK(&info->status_work, qcom_bms_status_work);
+	INIT_WORK(&info->status_work, qcom_bms_status_work);
 	psy_cfg.drv_data = info;
 	psy_cfg.fwnode = dev_fwnode(&pdev->dev);
 
@@ -1047,6 +1155,20 @@ static int qcom_bms_probe(struct platform_device *pdev)
 		"Qualcomm BMS coordinator registered (required auth mask %#x)\n",
 		info->required_auth_mask);
 
+	/*
+	 * Watch the tcpm source psy for CC-driven attach/detach - the real
+	 * charger-connection signal (VBUS-based detection is fooled by the SC
+	 * back-feeding VBUS to ~2*VBAT on unplug).  Resolved lazily; tcpm may
+	 * probe after us.
+	 */
+	info->tcpm_np = of_parse_phandle(pdev->dev.of_node, "qcom,tcpm-psy", 0);
+	if (!info->tcpm_np)
+		dev_warn(
+			&pdev->dev,
+			"qcom,tcpm-psy not specified; direct charge will not engage\n");
+	info->psy_nb.notifier_call = qcom_bms_psy_notifier;
+	power_supply_reg_notifier(&info->psy_nb);
+
 	return 0;
 }
 
@@ -1059,8 +1181,23 @@ static void qcom_bms_remove(struct platform_device *pdev)
 	g_bms = NULL;
 	mutex_unlock(&qcom_bms_mutex);
 
-	cancel_delayed_work_sync(&info->status_work);
+	power_supply_unreg_notifier(&info->psy_nb);
+	cancel_work_sync(&info->status_work);
+	if (info->tcpm_psy)
+		power_supply_put(info->tcpm_psy);
+	of_node_put(info->tcpm_np);
 }
+
+static int qcom_bms_resume(struct device *dev)
+{
+	struct qcom_bms_info *info = dev_get_drvdata(dev);
+
+	/* Re-evaluate: charging state may have changed during sleep. */
+	queue_work(system_freezable_wq, &info->status_work);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(qcom_bms_pm, NULL, qcom_bms_resume);
 
 static const struct of_device_id qcom_bms_of_match[] = {
 	{ .compatible = "qcom,pm8150b-bms" },
@@ -1072,6 +1209,7 @@ static struct platform_driver qcom_bms_driver = {
 	.driver = {
 		.name = "qcom-bms",
 		.of_match_table = qcom_bms_of_match,
+		.pm = pm_sleep_ptr(&qcom_bms_pm),
 	},
 	.probe = qcom_bms_probe,
 	.remove = qcom_bms_remove,

@@ -62,7 +62,6 @@
 #define DCP_CHARGER_BIT BIT(3)
 #define CDP_CHARGER_BIT BIT(2)
 #define OCP_CHARGER_BIT BIT(1)
-#define SDP_CHARGER_BIT BIT(0)
 
 #define USBIN_CMD_IL 0x340
 #define USBIN_SUSPEND_BIT BIT(0)
@@ -118,9 +117,6 @@
 #define SMB5_TYPE_C_EXIT_STATE_CFG 0x550
 #define SMB5_SEL_SRC_UPPER_REF_BIT BIT(2)
 
-#define BARK_BITE_WDOG_PET 0x643
-#define BARK_BITE_WDOG_PET_BIT BIT(0)
-
 #define WD_CFG 0x651
 #define WATCHDOG_TRIGGER_AFP_EN_BIT BIT(7)
 #define BARK_WDOG_INT_EN_BIT BIT(6)
@@ -160,7 +156,6 @@ struct smb_init_register {
 /**
  * struct smb_chip - smb chip structure
  * @dev:		Device reference
- * @name:		The platform device name
  * @base:		Base address for smb registers
  * @regmap:		Register map
  * @status_change_work: Worker to handle plug/unplug events
@@ -268,7 +263,7 @@ static int smb_apsd_get_charger_type(void *priv, int *val)
 		*val = POWER_SUPPLY_USB_TYPE_CDP;
 	else if (stat & (DCP_CHARGER_BIT | OCP_CHARGER_BIT | FLOAT_CHARGER_BIT))
 		*val = POWER_SUPPLY_USB_TYPE_DCP;
-	else /* SDP_CHARGER_BIT (or others) */
+	else /* SDP or unknown charger type */
 		*val = POWER_SUPPLY_USB_TYPE_SDP;
 
 	return 0;
@@ -586,21 +581,6 @@ static irqreturn_t smb_handle_usb_icl_change(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-static irqreturn_t smb_handle_wdog_bark(int irq, void *data)
-{
-	struct smb_chip *chip = data;
-	int rc;
-
-	qcom_bms_notify_changed(chip->dev);
-
-	rc = regmap_write(chip->regmap, chip->base + BARK_BITE_WDOG_PET,
-			  BARK_BITE_WDOG_PET_BIT);
-	if (rc < 0)
-		dev_err(chip->dev, "Couldn't pet the dog rc=%d\n", rc);
-
-	return IRQ_HANDLED;
-}
-
 /* Init sequence derived from vendor downstream driver */
 static const struct smb_init_register smb5_init_seq[] = {
 	{ .addr = USBIN_CMD_IL, .mask = USBIN_SUSPEND_BIT, .val = 0 },
@@ -726,7 +706,7 @@ static int smb_init_irq(struct smb_chip *chip, int *irq, const char *name,
 static int smb_probe(struct platform_device *pdev)
 {
 	struct smb_chip *chip;
-	int rc, irq;
+	int rc;
 
 	chip = devm_kzalloc(&pdev->dev, sizeof(*chip), GFP_KERNEL);
 	if (!chip)
@@ -785,7 +765,7 @@ static int smb_probe(struct platform_device *pdev)
 					     "Couldn't set vbat max\n");
 	}
 
-	rc = smb_init_irq(chip, &irq, "bat-ov", smb_handle_batt_overvoltage);
+	rc = smb_init_irq(chip, NULL, "bat-ov", smb_handle_batt_overvoltage);
 	if (rc < 0)
 		return rc;
 
@@ -794,11 +774,8 @@ static int smb_probe(struct platform_device *pdev)
 	if (rc < 0)
 		return rc;
 
-	rc = smb_init_irq(chip, &irq, "usbin-icl-change",
+	rc = smb_init_irq(chip, NULL, "usbin-icl-change",
 			  smb_handle_usb_icl_change);
-	if (rc < 0)
-		return rc;
-	rc = smb_init_irq(chip, &irq, "wdog-bark", smb_handle_wdog_bark);
 	if (rc < 0)
 		return rc;
 

@@ -135,6 +135,8 @@
 	qcom_bms: battery-manager {
 		compatible = "qcom,pm8150b-bms";
 		qcom,required-authenticators = <3>;
+		/* tcpm source psy (CC-driven attach/detach); powers direct-charge teardown */
+		qcom,tcpm-psy = <&pm8150b_typec>;
 		status = "okay";
 	};
 

@@ -16,7 +16,6 @@
 #include <linux/platform_device.h>
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
-#include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
 
@@ -1101,39 +1100,52 @@ static void qcom_fg_algorithms_update(struct qcom_fg_chip *chip)
 				    charge_done, input_present);
 }
 
-static int qcom_fg_get_current(struct qcom_fg_chip *chip, int *val)
+/*
+ * IBATT/VBATT are each backed by a shadow (checkpoint) register that must agree
+ * with the primary before the value is consumed.  Retry a few times and fail if
+ * they never settle.  On success @buf holds the matching primary data.
+ */
+static int qcom_fg_read_shadow_pair(struct qcom_fg_chip *chip, u16 addr,
+				    u16 addr_cp, u8 buf[2], const char *name)
 {
-	s16 temp;
-	u8 buf[2], buf_cp[2];
+	u8 buf_cp[2];
 	int ret, tries = 0;
 
-	/*
-	 * IBATT has shadow registers at 0xA2 and 0xA8. Retry until they match.
-	 */
 	while (tries < FG_MAX_READ_TRIES) {
-		ret = qcom_fg_read(chip, buf, PARAM_ADDR_BATT_CURRENT, 2);
+		ret = qcom_fg_read(chip, buf, addr, 2);
 		if (ret) {
-			dev_err(chip->dev, "Failed to read current: %d\n", ret);
+			dev_err(chip->dev, "Failed to read %s: %d\n", name, ret);
 			return ret;
 		}
 
-		ret = qcom_fg_read(chip, buf_cp, PARAM_ADDR_BATT_CURRENT_CP, 2);
+		ret = qcom_fg_read(chip, buf_cp, addr_cp, 2);
 		if (ret) {
-			dev_err(chip->dev, "Failed to read current CP: %d\n",
+			dev_err(chip->dev, "Failed to read %s CP: %d\n", name,
 				ret);
 			return ret;
 		}
 
 		if (buf[0] == buf_cp[0] && buf[1] == buf_cp[1])
-			break;
+			return 0;
 
 		tries++;
 	}
 
-	if (tries == FG_MAX_READ_TRIES) {
-		dev_err(chip->dev, "IBATT: shadow registers do not match\n");
-		return -EINVAL;
-	}
+	dev_err(chip->dev, "%s: shadow registers do not match\n", name);
+	return -EINVAL;
+}
+
+static int qcom_fg_get_current(struct qcom_fg_chip *chip, int *val)
+{
+	s16 temp;
+	u8 buf[2];
+	int ret;
+
+	/* IBATT shadow registers at 0xA2 and 0xA8; retry until they match. */
+	ret = qcom_fg_read_shadow_pair(chip, PARAM_ADDR_BATT_CURRENT,
+					PARAM_ADDR_BATT_CURRENT_CP, buf, "IBATT");
+	if (ret)
+		return ret;
 
 	temp = (s16)get_unaligned_le16(buf);
 
@@ -1145,36 +1157,14 @@ static int qcom_fg_get_current(struct qcom_fg_chip *chip, int *val)
 
 static int qcom_fg_get_voltage(struct qcom_fg_chip *chip, int *val)
 {
-	u8 buf[2], buf_cp[2];
-	int ret, tries = 0;
+	u8 buf[2];
+	int ret;
 
-	/*
-	 * VBATT has shadow registers at 0xA0 and 0xA6. Retry until they match.
-	 */
-	while (tries < FG_MAX_READ_TRIES) {
-		ret = qcom_fg_read(chip, buf, PARAM_ADDR_BATT_VOLTAGE, 2);
-		if (ret) {
-			dev_err(chip->dev, "Failed to read voltage: %d\n", ret);
-			return ret;
-		}
-
-		ret = qcom_fg_read(chip, buf_cp, PARAM_ADDR_BATT_VOLTAGE_CP, 2);
-		if (ret) {
-			dev_err(chip->dev, "Failed to read voltage CP: %d\n",
-				ret);
-			return ret;
-		}
-
-		if (buf[0] == buf_cp[0] && buf[1] == buf_cp[1])
-			break;
-
-		tries++;
-	}
-
-	if (tries == FG_MAX_READ_TRIES) {
-		dev_err(chip->dev, "VBATT: shadow registers do not match\n");
-		return -EINVAL;
-	}
+	/* VBATT shadow registers at 0xA0 and 0xA6; retry until they match. */
+	ret = qcom_fg_read_shadow_pair(chip, PARAM_ADDR_BATT_VOLTAGE,
+					PARAM_ADDR_BATT_VOLTAGE_CP, buf, "VBATT");
+	if (ret)
+		return ret;
 
 	*val = div_u64((u64)get_unaligned_le16(buf) * BATT_VOLTAGE_NUMR,
 		       BATT_VOLTAGE_DENR);
@@ -1511,13 +1501,19 @@ static void qcom_fg_read_state(struct qcom_fg_chip *chip)
 	}
 }
 
+/* Re-read the FG state, run cycle/capacity-learning bookkeeping, and notify. */
+static void qcom_fg_refresh(struct qcom_fg_chip *chip)
+{
+	qcom_fg_read_state(chip);
+	qcom_fg_algorithms_update(chip);
+	qcom_bms_notify_changed(chip->dev);
+}
+
 static irqreturn_t qcom_fg_handle_soc_delta(int irq, void *data)
 {
 	struct qcom_fg_chip *chip = data;
 
-	qcom_fg_read_state(chip);
-	qcom_fg_algorithms_update(chip);
-	qcom_bms_notify_changed(chip->dev);
+	qcom_fg_refresh(chip);
 	return IRQ_HANDLED;
 }
 
@@ -1981,9 +1977,7 @@ static int __maybe_unused qcom_fg_resume(struct device *dev)
 {
 	struct qcom_fg_chip *chip = dev_get_drvdata(dev);
 
-	qcom_fg_read_state(chip);
-	qcom_fg_algorithms_update(chip);
-	qcom_bms_notify_changed(chip->dev);
+	qcom_fg_refresh(chip);
 
 	return 0;
 }

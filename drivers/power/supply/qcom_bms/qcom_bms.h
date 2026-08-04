@@ -37,8 +37,8 @@ struct qcom_bms_fg_ops {
 	int (*set_charge_full)(void *priv, int uah);
 
 	/* Charging state supplied by the coordinator's charger backends. */
-	void (*charging_state_changed)(void *priv, int status,
-				       bool charge_done, bool input_present);
+	void (*charging_state_changed)(void *priv, int status, bool charge_done,
+				       bool input_present);
 };
 
 struct qcom_bms_charger_ops {
@@ -58,6 +58,13 @@ struct qcom_bms_charger_ops {
 
 	/* Inform the charger whether all required batteries are authentic. */
 	int (*set_authenticated)(void *priv, bool authenticated);
+
+	/*
+	 * Turn the direct-charge path on/off.  The coordinator decides when (based
+	 * on charger connection state, authentication, faults, VBAT) and owns the
+	 * PMIC USBIN handover; the charger implements only the SC standby mechanism.
+	 */
+	int (*set_charging_enabled)(void *priv, bool en);
 };
 
 enum qcom_bms_charger_role {
@@ -84,6 +91,5 @@ int qcom_bms_register_authenticator(struct device *dev,
 void qcom_bms_unregister_authenticator(struct device *dev);
 void qcom_bms_authentication_changed(struct device *dev, bool authenticated);
 void qcom_bms_notify_changed(struct device *dev);
-int qcom_bms_set_pmic_usbin_suspend(struct device *dev, bool suspend);
 
 #endif /* __QCOM_BMS_H__ */

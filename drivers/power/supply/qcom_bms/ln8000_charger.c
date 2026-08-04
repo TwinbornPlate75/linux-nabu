@@ -9,6 +9,7 @@
 #include <linux/err.h>
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
@@ -18,9 +19,7 @@
 #include <linux/power_supply.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
-#include <linux/slab.h>
 #include <linux/types.h>
-#include <linux/workqueue.h>
 
 #include "qcom_bms.h"
 
@@ -29,12 +28,8 @@
 #define LN8000_REG_INT1_MSK 0x02
 #define LN8000_REG_SYS_STS 0x03
 #define LN8000_REG_ADC01_STS 0x09
-#define LN8000_REG_ADC02_STS 0x0A
 #define LN8000_REG_ADC03_STS 0x0B
 #define LN8000_REG_ADC06_STS 0x0E
-#define LN8000_REG_ADC07_STS 0x0F
-#define LN8000_REG_ADC08_STS 0x10
-#define LN8000_REG_ADC09_STS 0x11
 #define LN8000_REG_IIN_CTRL 0x1B
 #define LN8000_REG_REGULATION_CTRL 0x1C
 #define LN8000_REG_SYS_CTRL 0x1E
@@ -68,7 +63,6 @@
 
 #define LN8000_MASK_WATCHDOG_TIMER_STS BIT(7)
 #define LN8000_MASK_VBAT_OV_STS BIT(6)
-#define LN8000_MASK_VAC_UNPLUG_STS BIT(4)
 #define LN8000_MASK_VIN_OV_STS BIT(1)
 
 #define LN8000_MASK_IIN_OC_DETECTED BIT(7)
@@ -94,15 +88,8 @@
 #define LN8000_VBAT_FLOAT_MAX 5000000
 #define LN8000_VBAT_FLOAT_LSB 5000
 #define LN8000_ADC_VIN_STEP 16000 /* uV */
-#define LN8000_ADC_VAC_STEP 16000
-#define LN8000_ADC_VAC_OS 5
 #define LN8000_ADC_VBAT_STEP 5000 /* uV */
 #define LN8000_ADC_IIN_STEP 4890 /* uA */
-#define LN8000_ADC_DIETEMP_STEP 4350 /* dC/1000 */
-#define LN8000_ADC_DIETEMP_DENOM 1000
-#define LN8000_ADC_DIETEMP_MIN (-250) /* dC */
-#define LN8000_ADC_DIETEMP_MAX 1600
-#define LN8000_ADC_NTCV_STEP 2933 /* uV */
 #define LN8000_IIN_CFG_MIN 500000 /* uA */
 #define LN8000_IIN_CFG_LSB 50000 /* uA */
 
@@ -142,21 +129,8 @@ enum ln8000_adc_hib_delay {
 	ADC_HIBERNATE_4S = 0x3,
 };
 
-/*
- * Self-management thresholds. The LN8000 enters direct-charge (switching) mode
- * only when the bus carries a high-voltage PD contract; with only a 5V supply
- * it stays in standby and lets the PMIC charger handle charging.
- */
-#define LN8000_VBUS_HV_TH 6500000 /* uV: above => high-voltage */
-#define LN8000_VBUS_LV_TH 5500000 /* uV: below => back to 5V/unplug */
-#define LN8000_MONITOR_INTERVAL_MS 2000
-
-/*
- * Xiaomi downstream prevents reverse-current / false switching by forcing
- * standby when VBUS collapses to roughly 2×VBAT (i.e. the SC stage is being
- * back-fed by the battery).  100mV is the threshold used there.
- */
-#define LN8000_VBAT_UV_OFFSET_TH 100000 /* uV: vbus - 2*vbat below => standby */
+/* Cooldown after a reverse-current trip before re-enabling direct charge. */
+#define LN8000_DC_BACKOFF_MS 10000
 
 struct ln8000_pdata {
 	u32 bat_ovp_th; /* uV */
@@ -179,8 +153,6 @@ struct ln8000_info {
 
 	struct ln8000_pdata pdata;
 
-	struct delayed_work monitor_work;
-
 	unsigned int op_mode;
 
 	bool tdie_fault;
@@ -188,15 +160,9 @@ struct ln8000_info {
 	bool vbat_ov;
 	bool vbus_ov;
 	bool iin_oc;
-	bool vac_unplug;
-	bool volt_qual;
 	bool chg_en;
-	bool authenticated;
-	bool suspended;
-
-	int vbus_uV;
-	int iin_uA;
-	int vbat_uV;
+	bool rcp_en;
+	unsigned long dc_backoff_until;
 };
 
 static int ln8000_read(struct ln8000_info *info, u8 reg, unsigned int *val)
@@ -374,12 +340,6 @@ static int ln8000_get_adc_data(struct ln8000_info *info, unsigned int ch,
 		adc_raw = ((sts[1] & 0x3F) << 4) | ((sts[0] & 0xF0) >> 4);
 		adc_final = adc_raw * LN8000_ADC_VIN_STEP;
 		break;
-	case LN8000_ADC_CH_VAC:
-		ret = ln8000_bulk_read(info, LN8000_REG_ADC02_STS, sts, 2);
-		adc_raw = (((sts[1] & 0x0F) << 6) | ((sts[0] & 0xFC) >> 2)) +
-			  LN8000_ADC_VAC_OS;
-		adc_final = adc_raw * LN8000_ADC_VAC_STEP;
-		break;
 	case LN8000_ADC_CH_VBAT:
 		ret = ln8000_bulk_read(info, LN8000_REG_ADC06_STS, sts, 2);
 		adc_raw = ((sts[1] & 0x03) << 8) | (sts[0] & 0xFF);
@@ -389,24 +349,6 @@ static int ln8000_get_adc_data(struct ln8000_info *info, unsigned int ch,
 		ret = ln8000_bulk_read(info, LN8000_REG_ADC01_STS, sts, 2);
 		adc_raw = ((sts[1] & 0x03) << 8) | (sts[0] & 0xFF);
 		adc_final = adc_raw * LN8000_ADC_IIN_STEP;
-		break;
-	case LN8000_ADC_CH_DIETEMP:
-		ret = ln8000_bulk_read(info, LN8000_REG_ADC07_STS, sts, 2);
-		adc_raw = ((sts[1] & 0x0F) << 6) | ((sts[0] & 0xFC) >> 2);
-		adc_final = (935 - adc_raw) * LN8000_ADC_DIETEMP_STEP /
-			    LN8000_ADC_DIETEMP_DENOM;
-		adc_final = clamp(adc_final, LN8000_ADC_DIETEMP_MIN,
-				  LN8000_ADC_DIETEMP_MAX);
-		break;
-	case LN8000_ADC_CH_TSBAT:
-		ret = ln8000_bulk_read(info, LN8000_REG_ADC08_STS, sts, 2);
-		adc_raw = ((sts[1] & 0x3F) << 4) | ((sts[0] & 0xF0) >> 4);
-		adc_final = adc_raw * LN8000_ADC_NTCV_STEP;
-		break;
-	case LN8000_ADC_CH_TSBUS:
-		ret = ln8000_bulk_read(info, LN8000_REG_ADC09_STS, sts, 2);
-		adc_raw = ((sts[1] & 0xFF) << 2) | ((sts[0] & 0xC0) >> 6);
-		adc_final = adc_raw * LN8000_ADC_NTCV_STEP;
 		break;
 	default:
 		ret = -EINVAL;
@@ -443,12 +385,10 @@ static int ln8000_check_status(struct ln8000_info *info)
 	info->tdie_fault = val[1] & LN8000_MASK_TEMP_MAX_STS;
 	info->wdt_fault = val[2] & LN8000_MASK_WATCHDOG_TIMER_STS;
 	info->vbat_ov = val[2] & LN8000_MASK_VBAT_OV_STS;
-	info->vac_unplug = val[2] & LN8000_MASK_VAC_UNPLUG_STS;
 	info->vbus_ov = val[2] & LN8000_MASK_VIN_OV_STS;
-	info->volt_qual = volt_qual;
-	if (info->volt_qual && info->chg_en) {
-		info->volt_qual = !(val[3] & BIT(5));
-		if (!info->volt_qual)
+	if (volt_qual && info->chg_en) {
+		volt_qual = !(val[3] & BIT(5));
+		if (!volt_qual)
 			clear_latched = true;
 	}
 	info->iin_oc = val[3] & LN8000_MASK_IIN_OC_DETECTED;
@@ -467,9 +407,12 @@ static int ln8000_check_status(struct ln8000_info *info)
 	return 0;
 }
 
-static int ln8000_pmic_usbin_suspend(struct ln8000_info *info, bool suspend)
+static int ln8000_enable_rcp(struct ln8000_info *info, bool en)
 {
-	return qcom_bms_set_pmic_usbin_suspend(info->dev, suspend);
+	WRITE_ONCE(info->rcp_en, en);
+	return ln8000_update(info, LN8000_REG_SYS_CTRL,
+			     BIT(LN8000_BIT_REV_IIN_DET),
+			     en ? BIT(LN8000_BIT_REV_IIN_DET) : 0);
 }
 
 static int ln8000_update_opmode(struct ln8000_info *info)
@@ -623,10 +566,18 @@ static int ln8000_enable_charging(struct ln8000_info *info, bool en)
 {
 	int ret;
 
+	/*
+	 * Serialize against the coordinator's evaluate_direct_charge() and the
+	 * threaded IRQ handler - both can reach this now that the coordinator
+	 * owns the enable/disable decision.
+	 */
+	guard(mutex)(&info->lock);
+
 	if (en) {
-		/* disable reverse-current protection at start-up */
-		ret = ln8000_update(info, LN8000_REG_SYS_CTRL,
-				    BIT(LN8000_BIT_REV_IIN_DET), 0);
+		/* Disable reverse-current protection at start-up; re-armed below
+		 * once switching is confirmed.
+		 */
+		ret = ln8000_enable_rcp(info, false);
 		if (ret < 0)
 			return ret;
 
@@ -642,38 +593,36 @@ static int ln8000_enable_charging(struct ln8000_info *info, bool en)
 			return ret;
 
 		if (READ_ONCE(info->op_mode) != LN8000_OPMODE_SWITCHING) {
-			dev_err(info->dev,
-				"LN8000 failed to enter switching mode\n");
 			/*
-			 * Return to standby so the next attempt re-arms the
-			 * standby->switching transition.  Otherwise STANDBY_EN
-			 * stays deasserted and the SC keeps attempting switching
-			 * (back-feeding VBUS from the battery), wedging the part
-			 * until a full re-init (reboot).
+			 * Not switching yet - usually VBUS hasn't settled at
+			 * the HV PDO during PD negotiation.  Roll back to standby
+			 * (so the next attempt re-arms the standby->switching
+			 * transition) and tell the coordinator to retry: -EAGAIN
+			 * is silent there.  Visible at debug level.
 			 */
+			dev_dbg(info->dev,
+				"LN8000 failed to enter switching mode\n");
 			ln8000_update(info, LN8000_REG_SYS_CTRL,
 				      BIT(LN8000_BIT_STANDBY_EN),
 				      BIT(LN8000_BIT_STANDBY_EN));
-			return -EIO;
+			return -EAGAIN;
 		}
 
-		/* back the PMIC USBIN charger off to avoid parallel charging */
-		ret = ln8000_pmic_usbin_suspend(info, true);
-		if (ret < 0) {
-			int rollback_ret;
-
-			rollback_ret =
-				ln8000_update(info, LN8000_REG_SYS_CTRL,
-					      BIT(LN8000_BIT_STANDBY_EN),
-					      BIT(LN8000_BIT_STANDBY_EN));
-			if (rollback_ret < 0)
-				dev_err(info->dev,
-					"failed to roll back direct charging: %d\n",
-					rollback_ret);
-			return ret;
-		}
-
+		/*
+		 * The coordinator suspends the PMIC USBIN charger to avoid
+		 * parallel charging (it owns the handover now).
+		 */
 		WRITE_ONCE(info->chg_en, true);
+
+		/*
+		 * Charging established (switching confirmed, startup transient
+		 * passed): arm reverse-current protection.  RCP only trips on
+		 * battery back-feed, so arming is safe regardless of forward
+		 * current.  Was armed by the periodic monitor; event-driven here.
+		 */
+		if (ln8000_enable_rcp(info, true))
+			dev_warn(info->dev,
+				 "failed to arm reverse-current protection\n");
 	} else {
 		ret = ln8000_update(info, LN8000_REG_SYS_CTRL,
 				    BIT(LN8000_BIT_STANDBY_EN),
@@ -681,10 +630,7 @@ static int ln8000_enable_charging(struct ln8000_info *info, bool en)
 		if (ret < 0)
 			return ret;
 
-		ret = ln8000_pmic_usbin_suspend(info, false);
-		if (ret < 0)
-			return ret;
-
+		WRITE_ONCE(info->rcp_en, false);
 		WRITE_ONCE(info->chg_en, false);
 	}
 
@@ -696,106 +642,6 @@ static bool ln8000_has_fault(struct ln8000_info *info)
 	return READ_ONCE(info->vbat_ov) || READ_ONCE(info->vbus_ov) ||
 	       READ_ONCE(info->iin_oc) || READ_ONCE(info->tdie_fault) ||
 	       READ_ONCE(info->wdt_fault);
-}
-
-static void ln8000_monitor_work(struct work_struct *work)
-{
-	struct ln8000_info *info =
-		container_of(work, struct ln8000_info, monitor_work.work);
-	bool authenticated;
-	bool back_fed;
-	bool fault;
-	bool vbus_low;
-	int ret;
-
-	/* Dropped if re-armed by the IRQ during suspend; resume re-arms it. */
-	if (READ_ONCE(info->suspended))
-		return;
-
-	ret = ln8000_check_status(info);
-	if (!ret)
-		ret = ln8000_update_opmode(info);
-	if (!ret)
-		ret = ln8000_get_adc_data(info, LN8000_ADC_CH_VIN,
-					  &info->vbus_uV);
-	if (!ret)
-		ret = ln8000_get_adc_data(info, LN8000_ADC_CH_VBAT,
-					  &info->vbat_uV);
-
-	/*
-	 * If communication fails, cached measurements may be stale.  Safely
-	 * leave direct-charge mode and let the PMIC charger take over.
-	 */
-	if (ret < 0) {
-		if (READ_ONCE(info->chg_en)) {
-			dev_warn(info->dev,
-				 "I2C error, disabling direct charge: %d\n",
-				 ret);
-			ret = ln8000_enable_charging(info, false);
-			if (ret < 0)
-				dev_err(info->dev,
-					"failed to disable direct charge: %d\n",
-					ret);
-			else
-				qcom_bms_notify_changed(info->dev);
-		}
-		goto reschedule;
-	}
-
-	authenticated = READ_ONCE(info->authenticated);
-	fault = ln8000_has_fault(info);
-	back_fed = info->vbus_uV - info->vbat_uV * 2 < LN8000_VBAT_UV_OFFSET_TH;
-	vbus_low = info->vbus_uV < LN8000_VBUS_LV_TH;
-
-	if (READ_ONCE(info->chg_en) &&
-	    (!authenticated || fault || back_fed || vbus_low ||
-	     READ_ONCE(info->vac_unplug) ||
-	     READ_ONCE(info->op_mode) != LN8000_OPMODE_SWITCHING)) {
-		if (!authenticated)
-			dev_warn(
-				info->dev,
-				"battery authentication lost, disabling direct charge\n");
-		else if (fault)
-			dev_warn(info->dev,
-				 "fault detected, disabling direct charge\n");
-		else if (back_fed)
-			dev_warn(
-				info->dev,
-				"VBUS back-fed by battery (vbus=%dmV, 2*vbat=%dmV), disabling direct charge\n",
-				info->vbus_uV / 1000, info->vbat_uV * 2 / 1000);
-		else if (READ_ONCE(info->op_mode) != LN8000_OPMODE_SWITCHING)
-			dev_warn(
-				info->dev,
-				"hardware left switching mode, disabling direct charge\n");
-		else
-			dev_info(
-				info->dev,
-				"VBUS=%dmV or unplugged, disabling direct charge\n",
-				info->vbus_uV / 1000);
-
-		ret = ln8000_enable_charging(info, false);
-		if (ret < 0)
-			dev_err(info->dev,
-				"failed to disable direct charge: %d\n", ret);
-		else
-			qcom_bms_notify_changed(info->dev);
-	} else if (!READ_ONCE(info->chg_en) && authenticated && !fault &&
-		   !back_fed && info->vbus_uV > LN8000_VBUS_HV_TH &&
-		   !READ_ONCE(info->vac_unplug)) {
-		dev_info(info->dev,
-			 "high-voltage VBUS=%dmV, enabling direct charge\n",
-			 info->vbus_uV / 1000);
-		ret = ln8000_enable_charging(info, true);
-		if (ret < 0)
-			dev_err(info->dev,
-				"failed to enable direct charge: %d\n", ret);
-		else
-			qcom_bms_notify_changed(info->dev);
-	}
-
-reschedule:
-	mod_delayed_work(system_wq, &info->monitor_work,
-			 msecs_to_jiffies(LN8000_MONITOR_INTERVAL_MS));
 }
 
 static int ln8000_get_status(void *priv, int *status)
@@ -823,27 +669,22 @@ static int ln8000_get_online(void *priv, int *online)
 static int ln8000_get_current_now(void *priv, int *val)
 {
 	struct ln8000_info *info = priv;
+	int iin;
 	int ret;
 
-	ret = ln8000_get_adc_data(info, LN8000_ADC_CH_IIN, &info->iin_uA);
+	ret = ln8000_get_adc_data(info, LN8000_ADC_CH_IIN, &iin);
 	if (ret < 0)
 		return ret;
 
-	*val = info->iin_uA * 2;
+	*val = iin * 2;
 	return 0;
 }
 
 static int ln8000_get_voltage_now(void *priv, int *val)
 {
 	struct ln8000_info *info = priv;
-	int ret;
 
-	ret = ln8000_get_adc_data(info, LN8000_ADC_CH_VIN, &info->vbus_uV);
-	if (ret < 0)
-		return ret;
-
-	*val = info->vbus_uV;
-	return 0;
+	return ln8000_get_adc_data(info, LN8000_ADC_CH_VIN, val);
 }
 
 static int ln8000_get_input_current_limit(void *priv, int *val)
@@ -877,14 +718,18 @@ static int ln8000_get_health(void *priv, int *val)
 	return 0;
 }
 
-static int ln8000_set_authenticated(void *priv, bool authenticated)
+static int ln8000_set_charging_enabled(void *priv, bool en)
 {
 	struct ln8000_info *info = priv;
 
-	WRITE_ONCE(info->authenticated, authenticated);
-	mod_delayed_work(system_wq, &info->monitor_work, 0);
+	/*
+	 * Refuse to re-enable during the cooldown after a reverse-current trip;
+	 * the coordinator retries on its next tick.  Disables always proceed.
+	 */
+	if (en && time_before(jiffies, READ_ONCE(info->dc_backoff_until)))
+		return -EAGAIN;
 
-	return 0;
+	return ln8000_enable_charging(info, en);
 }
 
 static const struct qcom_bms_charger_ops ln8000_charger_ops = {
@@ -894,7 +739,7 @@ static const struct qcom_bms_charger_ops ln8000_charger_ops = {
 	.get_voltage_now = ln8000_get_voltage_now,
 	.get_input_current_limit = ln8000_get_input_current_limit,
 	.get_health = ln8000_get_health,
-	.set_authenticated = ln8000_set_authenticated,
+	.set_charging_enabled = ln8000_set_charging_enabled,
 };
 
 static irqreturn_t ln8000_irq_handler(int irq, void *data)
@@ -943,13 +788,54 @@ static irqreturn_t ln8000_irq_handler(int irq, void *data)
 			qcom_bms_notify_changed(info->dev);
 	}
 
+	/*
+	 * Reverse-current trip: the SC was back-fed by the battery.  Stop
+	 * switching and arm a cooldown so the coordinator's re-enable attempts
+	 * (set_charging_enabled returns -EAGAIN) don't oscillate while the
+	 * adapter recovers or the PMIC lifts VBAT.
+	 */
+	if ((masked & LN8000_MASK_REV_CURR_INT) && READ_ONCE(info->chg_en)) {
+		dev_warn(info->dev,
+			 "reverse current detected, disabling direct charge\n");
+		WRITE_ONCE(info->dc_backoff_until,
+			   jiffies + msecs_to_jiffies(LN8000_DC_BACKOFF_MS));
+		ret = ln8000_enable_charging(info, false);
+		if (ret < 0)
+			dev_err(info->dev,
+				"failed to disable direct charge after RCP trip: %d\n",
+				ret);
+		else
+			qcom_bms_notify_changed(info->dev);
+	}
+
+	/*
+	 * Mode change (e.g. the SC dropped switching without a fault): the
+	 * cached op_mode was refreshed above by check_status(); re-evaluate so
+	 * the coordinator can recover (re-enable direct charge, or fall back to
+	 * the PMIC charger via the USBIN handover).  Was the periodic monitor's
+	 * job; event-driven here.
+	 */
+	if (masked & LN8000_MASK_MODE_INT)
+		qcom_bms_notify_changed(info->dev);
+
 out_reschedule:
-	if (ret < 0)
+	if (ret < 0) {
 		dev_warn_ratelimited(
 			info->dev, "failed to process charger IRQ: %d\n", ret);
 
-	/* React quickly to plug, unplug, and mode changes. */
-	mod_delayed_work(system_wq, &info->monitor_work, 0);
+		/*
+		 * Communication failure: cached state is stale; safely disable
+		 * direct charge (was the periodic monitor's job) and let the PMIC
+		 * charger take over.
+		 */
+		if (READ_ONCE(info->chg_en)) {
+			if (ln8000_enable_charging(info, false))
+				dev_err(info->dev,
+					"failed to disable direct charge after I2C error\n");
+			else
+				qcom_bms_notify_changed(info->dev);
+		}
+	}
 	return IRQ_HANDLED;
 }
 
@@ -958,8 +844,7 @@ static int ln8000_irq_init(struct ln8000_info *info)
 	struct ln8000_pdata *p = &info->pdata;
 	unsigned int mask;
 
-	mask = LN8000_MASK_ADC_DONE_INT | LN8000_MASK_TIMER_INT |
-	       LN8000_MASK_MODE_INT | LN8000_MASK_REV_CURR_INT;
+	mask = LN8000_MASK_ADC_DONE_INT | LN8000_MASK_TIMER_INT;
 	if (p->iin_reg_disable && p->vbat_reg_disable)
 		mask |= LN8000_MASK_CHARGE_PHASE_INT;
 	if (p->tbat_mon_disable && p->tbus_mon_disable)
@@ -1075,19 +960,11 @@ static int ln8000_probe(struct i2c_client *client)
 		enable_irq_wake(client->irq);
 	}
 
-	ret = devm_delayed_work_autocancel(dev, &info->monitor_work,
-					   ln8000_monitor_work);
-	if (ret < 0)
-		return ret;
-
 	ret = qcom_bms_register_charger(dev, QCOM_BMS_CHARGER_DIRECT,
 					&ln8000_charger_ops, info);
 	if (ret < 0)
 		return dev_err_probe(dev, ret,
 				     "failed to register with qcom_bms\n");
-
-	mod_delayed_work(system_wq, &info->monitor_work,
-			 msecs_to_jiffies(LN8000_MONITOR_INTERVAL_MS));
 
 	device_init_wakeup(dev, client->irq > 0);
 
@@ -1098,7 +975,6 @@ static void ln8000_remove(struct i2c_client *client)
 {
 	struct ln8000_info *info = i2c_get_clientdata(client);
 
-	cancel_delayed_work_sync(&info->monitor_work);
 	if (READ_ONCE(info->chg_en))
 		ln8000_enable_charging(info, false);
 	qcom_bms_unregister_charger(&client->dev);
@@ -1110,39 +986,6 @@ static void ln8000_shutdown(struct i2c_client *client)
 
 	ln8000_enable_charging(info, false);
 }
-
-static int ln8000_suspend(struct device *dev)
-{
-	struct ln8000_info *info = dev_get_drvdata(dev);
-
-	/*
-	 * Keep direct charge running across suspend (fast charging continues
-	 * while asleep).  Only stop the monitor: once the I2C bus is suspended
-	 * its transfers fail and the I2C-error path would wrongly disable
-	 * direct charge.  The suspended flag also drops any run re-armed by the
-	 * IRQ during suspend.  An unplug during sleep fires the wake IRQ
-	 * (FAULT_INT from VAC_UNPLUG) and triggers a full resume; the monitor,
-	 * re-armed on resume, then turns direct charge off and notifies qcom_bms.
-	 */
-	WRITE_ONCE(info->suspended, true);
-	cancel_delayed_work_sync(&info->monitor_work);
-
-	return 0;
-}
-
-static int ln8000_resume(struct device *dev)
-{
-	struct ln8000_info *info = dev_get_drvdata(dev);
-
-	WRITE_ONCE(info->suspended, false);
-
-	/* trigger an immediate re-evaluation of the charging state */
-	mod_delayed_work(system_wq, &info->monitor_work, 0);
-
-	return 0;
-}
-
-static DEFINE_SIMPLE_DEV_PM_OPS(ln8000_pm_ops, ln8000_suspend, ln8000_resume);
 
 static const struct of_device_id ln8000_of_match[] = {
 	{ .compatible = "lionsemi,ln8000" },
@@ -1157,7 +1000,6 @@ static struct i2c_driver ln8000_driver = {
 	.driver = {
 		.name = "ln8000-charger",
 		.of_match_table = ln8000_of_match,
-		.pm = pm_sleep_ptr(&ln8000_pm_ops),
 	},
 	.probe = ln8000_probe,
 	.remove = ln8000_remove,
