@@ -2987,6 +2987,15 @@ int ath10k_core_start(struct ath10k *ar, enum ath10k_firmware_mode mode,
 
 	ar->running_fw = fw;
 
+	/* WCN3990 HL firmware emits one chan_info event per scanned channel
+	 * plus a freq=0 completion marker, but its firmware-5.bin meta omits
+	 * the SINGLE_CHAN_INFO_PER_CHANNEL bit. Force it so the unpaired
+	 * handler is used instead of tripping the bounds check on freq=0.
+	 */
+	if (QCA_REV_WCN3990(ar))
+		set_bit(ATH10K_FW_FEATURE_SINGLE_CHAN_INFO_PER_CHANNEL,
+			ar->normal_mode_fw.fw_file.fw_features);
+
 	if (!test_bit(ATH10K_FW_FEATURE_NON_BMI,
 		      ar->running_fw->fw_file.fw_features)) {
 		ath10k_bmi_start(ar);
