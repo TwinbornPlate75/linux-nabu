@@ -15,6 +15,7 @@
 #include <linux/ctype.h>
 #include <linux/pm_qos.h>
 #include <linux/nvmem-consumer.h>
+#include <linux/etherdevice.h>
 #include <asm/byteorder.h>
 
 #include "core.h"
@@ -52,6 +53,10 @@ module_param(skip_otp, bool, 0644);
 module_param(fw_diag_log, bool, 0644);
 module_param_named(frame_mode, ath10k_frame_mode, uint, 0644);
 module_param_named(coredump_mask, ath10k_coredump_mask, ulong, 0444);
+
+char *ath10k_macaddr_param;
+module_param_named(macaddr, ath10k_macaddr_param, charp, 0444);
+MODULE_PARM_DESC(macaddr, "MAC address override, xx:xx:xx:xx:xx:xx");
 
 MODULE_PARM_DESC(debug_mask, "Debugging mask");
 MODULE_PARM_DESC(uart_print, "Uart target debugging");
@@ -3462,7 +3467,14 @@ static int ath10k_core_probe_fw(struct ath10k *ar)
 		ath10k_debug_print_board_info(ar);
 	}
 
-	device_get_mac_address(ar->dev, ar->mac_addr);
+	if (ath10k_macaddr_param &&
+	    mac_pton(ath10k_macaddr_param, ar->mac_addr) &&
+	    is_valid_ether_addr(ar->mac_addr)) {
+		ath10k_dbg(ar, ATH10K_DBG_BOOT, "using cmdline mac addr %pM\n",
+			   ar->mac_addr);
+	} else {
+		device_get_mac_address(ar->dev, ar->mac_addr);
+	}
 
 	ret = ath10k_core_init_firmware_features(ar);
 	if (ret) {
