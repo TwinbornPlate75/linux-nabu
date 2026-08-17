@@ -3,6 +3,7 @@
 
 #include <linux/regulator/consumer.h>
 #include <linux/delay.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/uaccess.h>
 #include <linux/platform_device.h>
@@ -28,17 +29,19 @@ struct xiaomi_keyboard_data {
 	struct pinctrl_state *pins_suspend;
 	struct notifier_block lid_notif;
 	struct notifier_block drm_notif;
-	struct work_struct resume_work;
-	struct work_struct suspend_work;
-	struct work_struct lid_work;
+	/* Single work applying the state below, serialized by lock */
+	struct work_struct state_work;
+	struct mutex lock;
 	struct xiaomi_keyboard_platdata *pdata;
 
 	int irq;
-	bool dev_pm_suspend;
+	bool irq_wake_enabled;
 	bool lid_is_closed;
-	bool keyboard_is_enable;
+	/* Keyboard hardware currently powered on */
+	bool powered_on;
 	bool is_in_suspend;
-	bool keyboard_switch;
-	bool lid_updated;
+	/* Enable switch set from userspace via sysfs */
+	bool user_enabled;
+	bool screen_is_on;
 };
 #endif
