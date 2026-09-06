@@ -16,6 +16,7 @@
 #include <linux/pm_qos.h>
 #include <linux/nvmem-consumer.h>
 #include <linux/etherdevice.h>
+#include <crypto/hash.h>
 #include <asm/byteorder.h>
 
 #include "core.h"
@@ -66,6 +67,38 @@ MODULE_PARM_DESC(frame_mode,
 		 "Datapath frame mode (0: raw, 1: native wifi (default), 2: ethernet)");
 MODULE_PARM_DESC(coredump_mask, "Bitfield of what to include in firmware crash file");
 MODULE_PARM_DESC(fw_diag_log, "Diag based fw log debugging");
+
+/* Generate a stable MAC from the board serial (SHA-256 based) */
+static int ath10k_get_mac_from_serial(u8 *mac)
+{
+	struct crypto_shash *tfm;
+	const char *serial;
+	u8 hash[SHA256_DIGEST_SIZE];
+	int ret;
+
+	serial = dmi_get_system_info(DMI_BOARD_SERIAL);
+	if (!serial || !serial[0])
+		return -ENOENT;
+
+	tfm = crypto_alloc_shash("sha256", 0, 0);
+	if (IS_ERR(tfm))
+		return PTR_ERR(tfm);
+
+	ret = crypto_shash_tfm_digest(tfm, serial, strlen(serial), hash);
+	crypto_free_shash(tfm);
+	if (ret)
+		return ret;
+
+	/* Use first 6 bytes of hash; mark as locally administered unicast */
+	mac[0] = (hash[0] & 0xFC) | 0x02;
+	mac[1] = hash[1];
+	mac[2] = hash[2];
+	mac[3] = hash[3];
+	mac[4] = hash[4];
+	mac[5] = hash[5];
+
+	return 0;
+}
 
 static const struct ath10k_hw_params ath10k_hw_params_list[] = {
 	{
@@ -3474,6 +3507,13 @@ static int ath10k_core_probe_fw(struct ath10k *ar)
 			   ar->mac_addr);
 	} else {
 		device_get_mac_address(ar->dev, ar->mac_addr);
+	}
+
+	/* Fallback: generate MAC from board serial when device has no valid MAC */
+	if (!is_valid_ether_addr(ar->mac_addr) &&
+	    !ath10k_get_mac_from_serial(ar->mac_addr)) {
+		ath10k_dbg(ar, ATH10K_DBG_BOOT,
+			   "using serial-derived mac addr %pM\n", ar->mac_addr);
 	}
 
 	ret = ath10k_core_init_firmware_features(ar);
