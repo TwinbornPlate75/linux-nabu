@@ -71,28 +71,34 @@ static void nvt_irq_enable(bool enable)
 	}
 }
 
-static inline int32_t spi_read_write(struct spi_device *client, uint8_t *buf,
-				     size_t len, NVT_SPI_RW rw)
+static inline int32_t nvt_spi_read(struct spi_device *client, uint8_t *buf,
+				   size_t len)
+{
+	struct spi_message m;
+	struct spi_transfer t = {
+		.len = len + DUMMY_BYTES,
+		.tx_buf = ts->xbuf,
+		.rx_buf = ts->rbuf,
+	};
+
+	memset(ts->xbuf, 0, len + DUMMY_BYTES);
+	ts->xbuf[0] = buf[0];
+
+	spi_message_init(&m);
+	spi_message_add_tail(&t, &m);
+	return spi_sync(client, &m);
+}
+
+static inline int32_t nvt_spi_write(struct spi_device *client, uint8_t *buf,
+				    size_t len)
 {
 	struct spi_message m;
 	struct spi_transfer t = {
 		.len = len,
+		.tx_buf = ts->xbuf,
 	};
 
-	memset(ts->xbuf, 0, len + DUMMY_BYTES);
 	memcpy(ts->xbuf, buf, len);
-
-	switch (rw) {
-	case NVTREAD:
-		t.tx_buf = ts->xbuf;
-		t.rx_buf = ts->rbuf;
-		t.len = (len + DUMMY_BYTES);
-		break;
-
-	case NVTWRITE:
-		t.tx_buf = ts->xbuf;
-		break;
-	}
 
 	spi_message_init(&m);
 	spi_message_add_tail(&t, &m);
@@ -116,7 +122,7 @@ int32_t CTP_SPI_READ(struct spi_device *client, uint8_t *buf, uint16_t len)
 	buf[0] = SPI_READ_MASK(buf[0]);
 
 	while (retries < 5) {
-		ret = spi_read_write(client, buf, len, NVTREAD);
+		ret = nvt_spi_read(client, buf, len);
 		if (ret == 0)
 			break;
 		retries++;
@@ -128,24 +134,6 @@ int32_t CTP_SPI_READ(struct spi_device *client, uint8_t *buf, uint16_t len)
 	} else {
 		memcpy((buf + 1), (ts->rbuf + 2), (len - 1));
 	}
-
-	mutex_unlock(&ts->xbuf_lock);
-
-	return ret;
-}
-
-static inline int32_t CTP_SPI_READ_NO_RETRY(struct spi_device *client,
-					    uint8_t *buf, uint16_t len)
-{
-	int32_t ret = -1;
-
-	mutex_lock(&ts->xbuf_lock);
-
-	buf[0] = SPI_READ_MASK(buf[0]);
-
-	ret = spi_read_write(client, buf, len, NVTREAD);
-
-	memcpy((buf + 1), (ts->rbuf + 2), (len - 1));
 
 	mutex_unlock(&ts->xbuf_lock);
 
@@ -169,7 +157,7 @@ int32_t CTP_SPI_WRITE(struct spi_device *client, uint8_t *buf, uint16_t len)
 	buf[0] = SPI_WRITE_MASK(buf[0]);
 
 	while (retries < 5) {
-		ret = spi_read_write(client, buf, len, NVTWRITE);
+		ret = nvt_spi_write(client, buf, len);
 		if (ret == 0)
 			break;
 		retries++;
@@ -744,9 +732,6 @@ return:
 *******************************************************/
 static irqreturn_t nvt_ts_work_func(int irq, void *data)
 {
-	uint8_t point_data[POINT_DATA_LEN + PEN_DATA_LEN + 1 + DUMMY_BYTES] = {
-		0
-	};
 	uint32_t position = 0;
 	uint32_t input_x = 0;
 	uint32_t input_y = 0;
@@ -766,6 +751,8 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 	uint32_t pen_btn1 = 0;
 	uint32_t pen_btn2 = 0;
 	uint32_t pen_battery = 0;
+	uint8_t cmd;
+	uint8_t *buf;
 
 	static struct task_struct *touch_task = NULL;
 
@@ -782,18 +769,24 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 		}
 	}
 
-	if (CTP_SPI_READ_NO_RETRY(ts->client, point_data,
-				  ts->pen_support ?
-					  POINT_DATA_LEN + PEN_DATA_LEN + 1 :
-					  POINT_DATA_LEN + 1) < 0) {
+	mutex_lock(&ts->xbuf_lock);
+	cmd = SPI_READ_MASK(0);
+	if (nvt_spi_read(ts->client, &cmd,
+			 ts->pen_support ? POINT_DATA_LEN + PEN_DATA_LEN + 1 :
+					   POINT_DATA_LEN + 1) < 0) {
+		mutex_unlock(&ts->xbuf_lock);
 		NVT_ERR("CTP_SPI_READ failed\n");
 		return IRQ_HANDLED;
 	}
+	mutex_unlock(&ts->xbuf_lock);
+
+	/* Data starts at ts->rbuf + 2, buf[1] maps to ts->rbuf[2] */
+	buf = ts->rbuf + 1;
 
 	/* ESD protect by WDT */
-	if (nvt_wdt_fw_recovery(point_data)) {
-		NVT_ERR("Recover for fw reset, %02X\n", point_data[1]);
-		if (point_data[1] == 0xFD) {
+	if (nvt_wdt_fw_recovery(buf)) {
+		NVT_ERR("Recover for fw reset, %02X\n", buf[1]);
+		if (buf[1] == 0xFD) {
 			NVT_ERR("Dump FW history:\n");
 			nvt_dump_fw_history();
 		}
@@ -801,39 +794,37 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 		return IRQ_HANDLED;
 	}
 
-	if (nvt_fw_recovery(point_data))
+	if (nvt_fw_recovery(buf))
 		return IRQ_HANDLED;
 
 	finger_cnt = 0;
 
 	for (i = 0; i < ts->max_touch_num; i++) {
 		position = 1 + 6 * i;
-		input_id = (uint8_t)(point_data[position + 0] >> 3);
+		input_id = (uint8_t)(buf[position + 0] >> 3);
 		if ((input_id == 0) || (input_id > ts->max_touch_num))
 			continue;
 
-		if (((point_data[position] & 0x07) == 0x01) ||
-		    ((point_data[position] & 0x07) ==
+		if (((buf[position] & 0x07) == 0x01) ||
+		    ((buf[position] & 0x07) ==
 		     0x02)) { //finger down (enter & moving)
-			input_x = (uint32_t)(point_data[position + 1] << 4) +
-				  (uint32_t)(point_data[position + 3] >> 4);
-			input_y = (uint32_t)(point_data[position + 2] << 4) +
-				  (uint32_t)(point_data[position + 3] & 0x0F);
-			if ((input_x < 0) || (input_y < 0))
-				continue;
+			input_x = (uint32_t)(buf[position + 1] << 4) +
+				  (uint32_t)(buf[position + 3] >> 4);
+			input_y = (uint32_t)(buf[position + 2] << 4) +
+				  (uint32_t)(buf[position + 3] & 0x0F);
 			if ((input_x > ts->abs_x_max) ||
 			    (input_y > ts->abs_y_max))
 				continue;
-			input_w = (uint32_t)(point_data[position + 4]);
+			input_w = (uint32_t)(buf[position + 4]);
 			if (input_w == 0)
 				input_w = 1;
 			if (i < 2) {
-				input_p = (uint32_t)(point_data[position + 5]) +
-					  (uint32_t)(point_data[i + 63] << 8);
+				input_p = (uint32_t)(buf[position + 5]) +
+					  (uint32_t)(buf[i + 63] << 8);
 				if (input_p > TOUCH_FORCE_NUM)
 					input_p = TOUCH_FORCE_NUM;
 			} else {
-				input_p = (uint32_t)(point_data[position + 5]);
+				input_p = (uint32_t)(buf[position + 5]);
 			}
 			if (input_p == 0)
 				input_p = 1;
@@ -873,29 +864,27 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 		return IRQ_HANDLED;
 
 	// parse and handle pen report
-	pen_format_id = point_data[66];
+	pen_format_id = buf[66];
 	if (pen_format_id != 0xFF) {
 		if (pen_format_id == 0x01) {
 			// report pen data
-			pen_x = (uint32_t)(point_data[67] << 8) +
-				(uint32_t)(point_data[68]);
-			pen_y = (uint32_t)(point_data[69] << 8) +
-				(uint32_t)(point_data[70]);
+			pen_x = (uint32_t)(buf[67] << 8) + (uint32_t)(buf[68]);
+			pen_y = (uint32_t)(buf[69] << 8) + (uint32_t)(buf[70]);
 			if (pen_x >= ts->abs_x_max * 8 - 1) {
 				pen_x -= 1;
 			}
 			if (pen_y >= ts->abs_y_max * 8 - 1) {
 				pen_y -= 1;
 			}
-			pen_pressure = (uint32_t)(point_data[71] << 8) +
-				       (uint32_t)(point_data[72]);
-			pen_tilt_x = (int32_t)point_data[73];
-			pen_tilt_y = (int32_t)point_data[74];
-			pen_distance = (uint32_t)(point_data[75] << 8) +
-				       (uint32_t)(point_data[76]);
-			pen_btn1 = (uint32_t)(point_data[77] & 0x01);
-			pen_btn2 = (uint32_t)((point_data[77] >> 1) & 0x01);
-			pen_battery = (uint32_t)point_data[78];
+			pen_pressure =
+				(uint32_t)(buf[71] << 8) + (uint32_t)(buf[72]);
+			pen_tilt_x = (int8_t)buf[73];
+			pen_tilt_y = (int8_t)buf[74];
+			pen_distance =
+				(uint32_t)(buf[75] << 8) + (uint32_t)(buf[76]);
+			pen_btn1 = (uint32_t)(buf[77] & 0x01);
+			pen_btn2 = (uint32_t)((buf[77] >> 1) & 0x01);
+			pen_battery = (uint32_t)buf[78];
 
 			input_report_abs(ts->pen_input_dev, ABS_X, pen_x);
 			input_report_abs(ts->pen_input_dev, ABS_Y, pen_y);

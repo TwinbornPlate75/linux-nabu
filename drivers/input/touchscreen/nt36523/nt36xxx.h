@@ -27,10 +27,6 @@
 
 #include "nt36xxx_mem_map.h"
 
-//---GPIO number---
-#define NVTTOUCH_RST_PIN 980
-#define NVTTOUCH_INT_PIN 943
-
 #define PINCTRL_STATE_ACTIVE "pmx_ts_active"
 #define PINCTRL_STATE_SUSPEND "pmx_ts_suspend"
 
@@ -67,7 +63,6 @@
 
 //---Firmware path---
 #define DEFAULT_BOOT_UPDATE_FIRMWARE_NAME "novatek/nt36523.bin"
-#define DEFAULT_MP_UPDATE_FIRMWARE_NAME "novatek_ts_mp.bin"
 
 enum nvt_ic_state {
 	NVT_IC_SUSPEND_IN,
@@ -131,13 +126,12 @@ typedef enum {
 	RESET_STATE_MAX = 0xAF
 } RST_COMPLETE_STATE;
 
-typedef enum {
-	EVENT_MAP_HOST_CMD = 0x50,
-	EVENT_MAP_HANDSHAKING_or_SUB_CMD_BYTE = 0x51,
-	EVENT_MAP_RESET_COMPLETE = 0x60,
-	EVENT_MAP_FWINFO = 0x78,
-	EVENT_MAP_PROJECTID = 0x9A,
-} SPI_EVENT_MAP;
+//---Event map---
+#define EVENT_MAP_HOST_CMD 0x50
+#define EVENT_MAP_HANDSHAKING_or_SUB_CMD_BYTE 0x51
+#define EVENT_MAP_RESET_COMPLETE 0x60
+#define EVENT_MAP_FWINFO 0x78
+#define EVENT_MAP_PROJECTID 0x9A
 
 //---SPI READ/WRITE---
 #define SPI_WRITE_MASK(a) (a | 0x80)
@@ -147,14 +141,11 @@ typedef enum {
 #define NVT_TRANSFER_LEN (63 * 1024)
 #define NVT_READ_LEN (2 * 1024)
 
-typedef enum { NVTWRITE = 0, NVTREAD = 1 } NVT_SPI_RW;
-
 //---extern structures---
 extern struct nvt_ts_data *ts;
 
 //---extern functions---
-int32_t CTP_SPI_READ(struct spi_device *client, uint8_t *buf,
-			  uint16_t len);
+int32_t CTP_SPI_READ(struct spi_device *client, uint8_t *buf, uint16_t len);
 int32_t CTP_SPI_WRITE(struct spi_device *client, uint8_t *buf, uint16_t len);
 void nvt_bootloader_reset(void);
 void nvt_eng_reset(void);
