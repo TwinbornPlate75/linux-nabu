@@ -1091,12 +1091,19 @@ static int dsi_7nm_phy_enable(struct msm_dsi_phy *phy,
 	}
 
 	spin_lock_irqsave(&pll->pll_enable_lock, flags);
-	pll->pll_enable_cnt = 1;
 	/* de-assert digital and pll power down */
 	data = DSI_7nm_PHY_CMN_CTRL_0_DIGTOP_PWRDN_B |
 	       DSI_7nm_PHY_CMN_CTRL_0_PLL_SHUTDOWNB;
 	writel(data, base + REG_DSI_7nm_PHY_CMN_CTRL_0);
 	spin_unlock_irqrestore(&pll->pll_enable_lock, flags);
+
+	/*
+	 * Keep the PLL bias enabled while the PHY is up. In bonded DSI mode the
+	 * PHYs are enabled before any PLL clock operation, so this is the first
+	 * bias user and the one programming SYSTEM_MUXES, which routes PLL0 to
+	 * the second link.
+	 */
+	dsi_pll_enable_pll_bias(pll);
 
 	/* Assert PLL core reset */
 	writel(0x00, base + REG_DSI_7nm_PHY_CMN_PLL_CNTRL);
@@ -1239,10 +1246,12 @@ static void dsi_7nm_phy_disable(struct msm_dsi_phy *phy)
 	writel(0, base + REG_DSI_7nm_PHY_CMN_LANE_CTRL0);
 
 	spin_lock_irqsave(&pll->pll_enable_lock, flags);
-	pll->pll_enable_cnt = 0;
 	/* Turn off all PHY blocks */
 	writel(0x00, base + REG_DSI_7nm_PHY_CMN_CTRL_0);
 	spin_unlock_irqrestore(&pll->pll_enable_lock, flags);
+
+	/* Release the reference taken in dsi_7nm_phy_enable() */
+	dsi_pll_disable_pll_bias(pll);
 
 	/* make sure phy is turned off */
 	wmb();
