@@ -383,6 +383,11 @@ static void gpio_keys_gpio_report_event(struct gpio_button_data *bdata)
 		input_event(input, type, *bdata->code, state);
 	}
 
+	/*
+	 * Callbacks of this chain may sleep, so this has to run in a sleepable
+	 * context: gpio_keys_setup_key() keeps the software debounce on the
+	 * workqueue for every button that enables the chain.
+	 */
 	if (type == EV_SW && button->enable_notify_chain)
 		blocking_notifier_call_chain(&gpio_keys_lid_notifier,
 					     *bdata->code, &state);
@@ -570,9 +575,16 @@ static int gpio_keys_setup_key(struct platform_device *pdev,
 			 * If reading the GPIO won't sleep, we can use a
 			 * hrtimer instead of a standard timer for the software
 			 * debounce, to reduce the latency as much as possible.
+			 *
+			 * Buttons that fire the switch notifier chain have to
+			 * stay on the workqueue: the notification is sent from
+			 * the debounce callback, and callbacks of that chain are
+			 * allowed to sleep, which is not allowed in a hrtimer
+			 * callback.
 			 */
 			bdata->debounce_use_hrtimer =
-					!gpiod_cansleep(bdata->gpiod);
+					!gpiod_cansleep(bdata->gpiod) &&
+					!button->enable_notify_chain;
 		}
 
 		/*

@@ -108,7 +108,9 @@ patternProperties:
           chain callback when its state changes. This is useful for kernel
           subsystems that need direct notification of cover open/close events
           (e.g. SW_LID). Callbacks are registered via
-          gpio_keys_lid_notifier_register().
+          gpio_keys_lid_notifier_register() and are invoked from a workqueue,
+          so they may sleep. To allow that, such a button keeps its software
+          debounce on the workqueue as well instead of using a hrtimer.
         type: boolean
 
     required:

@@ -20,7 +20,10 @@ struct device;
  * @debounce_interval:	debounce ticks interval in msecs
  * @can_disable:	%true indicates that userspace is allowed to
  *			disable button via sysfs
- * @enable_notify_chain:	%true enables firing a kernel notifier on switch events
+ * @enable_notify_chain:	%true enables firing a kernel notifier on switch
+ *			events; such buttons keep their software debounce on
+ *			the workqueue, so the callbacks (which may sleep) run
+ *			in a sleepable context
  * @value:		axis value for %EV_ABS
  * @irq:		Irq number in case of interrupt keys
  * @wakeirq:		Optional dedicated wake-up interrupt
