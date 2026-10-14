@@ -243,6 +243,23 @@
 			wakeup-source;
 		};
 	};
+
+	/*
+	 * The two hall sensors next to the stylus park position. The pen's
+	 * magnets pull their outputs low, hence active low. The touchscreen
+	 * (pen sensing has to stay off while the pen is parked) and the
+	 * wireless pen charger (charging has to start) both read this state
+	 * through the pen dock driver instead of requesting the lines
+	 * themselves.
+	 */
+	pen-dock {
+		compatible = "xiaomi,pen-dock";
+		pen-dock-gpios = <&tlmm 101 GPIO_ACTIVE_LOW>,
+				 <&tlmm 134 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&hall_intr3_active &hall_intr4_active>;
+		wakeup-source;
+	};
 };
 
 &apps_rsc {
@@ -1524,8 +1541,6 @@
 		status = "ok";
 		reg = <0x3b>;
 		idt,irq-gpios = <&tlmm 95 GPIO_ACTIVE_HIGH>;
-		idt,hall3-gpios = <&tlmm 101 GPIO_ACTIVE_HIGH>;
-		idt,hall4-gpios = <&tlmm 134 GPIO_ACTIVE_HIGH>;
 		idt,reverse-enable-gpios = <&tlmm 3 GPIO_ACTIVE_HIGH>;
 		idt,reverse-boost-enable-gpios = <&tlmm 47 GPIO_ACTIVE_HIGH>;
 		pinctrl-names = "idt_active", "idt_suspend";

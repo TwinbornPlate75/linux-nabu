@@ -12,6 +12,7 @@
 #include <linux/fs.h>
 #include <linux/wait.h>
 #include <linux/kfifo.h>
+#include <linux/pen_dock.h>
 #include "idtp9418.h"
 
 struct idtp9418_event {
@@ -40,10 +41,10 @@ struct idtp9418_device_info {
 	struct delayed_work reverse_ept_type_work;
 
 	struct gpio_desc *irq_gpiod;
-	struct gpio_desc *hall3_gpiod;
-	struct gpio_desc *hall4_gpiod;
 	struct gpio_desc *reverse_gpiod;
 	struct gpio_desc *reverse_boost_en_gpiod;
+
+	struct notifier_block pen_dock_nb;
 
 	bool is_attached;
 	bool is_charging;
@@ -342,13 +343,8 @@ static void idtp9418_hall_irq_work(struct work_struct *work)
 {
 	struct idtp9418_device_info *di = container_of(
 		work, struct idtp9418_device_info, hall_irq_work.work);
-	bool attached;
 
-	attached = !gpiod_get_value(di->hall3_gpiod) ||
-		   !gpiod_get_value(di->hall4_gpiod);
-	di->is_attached = attached;
-
-	if (!attached)
+	if (!di->is_attached)
 		goto out;
 
 	idtp9418_set_reverse_gpio(di, true);
@@ -360,21 +356,25 @@ out:
 	pm_relax(di->dev);
 }
 
+static int idtp9418_pen_dock_notifier_callback(struct notifier_block *nb,
+					       unsigned long event, void *data)
+{
+	struct idtp9418_device_info *di =
+		container_of(nb, struct idtp9418_device_info, pen_dock_nb);
+
+	di->is_attached = event;
+	pm_stay_awake(di->dev);
+	schedule_delayed_work(&di->hall_irq_work, 0);
+
+	return NOTIFY_OK;
+}
+
 static irqreturn_t idtp9418_irq_handler(int irq, void *dev_id)
 {
 	struct idtp9418_device_info *di = dev_id;
 
 	pm_stay_awake(di->dev);
 	schedule_delayed_work(&di->irq_work, msecs_to_jiffies(10));
-	return IRQ_HANDLED;
-}
-
-static irqreturn_t idtp9418_hall_irq_handler(int irq, void *dev_id)
-{
-	struct idtp9418_device_info *di = dev_id;
-
-	pm_stay_awake(di->dev);
-	schedule_delayed_work(&di->hall_irq_work, msecs_to_jiffies(10));
 	return IRQ_HANDLED;
 }
 
@@ -472,22 +472,6 @@ static int idtp9418_parse_dt(struct idtp9418_device_info *di)
 		return PTR_ERR(di->irq_gpiod);
 	}
 
-	di->hall3_gpiod =
-		devm_gpiod_get_optional(di->dev, "idt,hall3", GPIOD_IN);
-	if (IS_ERR(di->hall3_gpiod)) {
-		dev_err(di->dev, "get hall3 gpio failed: %ld\n",
-			PTR_ERR(di->hall3_gpiod));
-		di->hall3_gpiod = NULL;
-	}
-
-	di->hall4_gpiod =
-		devm_gpiod_get_optional(di->dev, "idt,hall4", GPIOD_IN);
-	if (IS_ERR(di->hall4_gpiod)) {
-		dev_err(di->dev, "get hall4 gpio failed: %ld\n",
-			PTR_ERR(di->hall4_gpiod));
-		di->hall4_gpiod = NULL;
-	}
-
 	di->reverse_gpiod =
 		devm_gpiod_get(di->dev, "idt,reverse-enable", GPIOD_OUT_LOW);
 	if (IS_ERR(di->reverse_gpiod)) {
@@ -523,33 +507,6 @@ static int idtp9418_irq_request(struct idtp9418_device_info *di)
 		return ret;
 	}
 	return enable_irq_wake(irq);
-}
-
-static int idtp9418_hall_gpio_request(struct idtp9418_device_info *di,
-				      struct gpio_desc *gpiod, const char *name)
-{
-	int irq = gpiod_to_irq(gpiod);
-	int ret;
-
-	if (irq < 0)
-		return irq;
-	ret = devm_request_irq(di->dev, irq, idtp9418_hall_irq_handler,
-			       IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING, name,
-			       di);
-	if (ret < 0)
-		return ret;
-	enable_irq_wake(irq);
-	return 0;
-}
-
-static int idtp9418_hall_irq_request(struct idtp9418_device_info *di)
-{
-	int ret;
-
-	ret = idtp9418_hall_gpio_request(di, di->hall3_gpiod, "idtp_hall3");
-	if (ret < 0)
-		return ret;
-	return idtp9418_hall_gpio_request(di, di->hall4_gpiod, "idtp_hall4");
 }
 
 static int idtp9418_get_property(struct power_supply *psy,
@@ -602,6 +559,8 @@ static int idtp9418_set_property(struct power_supply *psy,
 
 static void idtp9418_cancel_works(struct idtp9418_device_info *di)
 {
+	/* unregister first: it waits for a callback that is already running */
+	pen_dock_unregister_notifier(&di->pen_dock_nb);
 	cancel_delayed_work_sync(&di->irq_work);
 	cancel_delayed_work_sync(&di->hall_irq_work);
 	cancel_delayed_work_sync(&di->reverse_ept_type_work);
@@ -671,10 +630,6 @@ static int idtp9418_probe(struct i2c_client *client)
 	if (ret < 0)
 		goto cleanup;
 
-	ret = idtp9418_hall_irq_request(di);
-	if (ret < 0)
-		goto cleanup;
-
 	psy_desc = devm_kzalloc(&client->dev, sizeof(*psy_desc), GFP_KERNEL);
 	if (!psy_desc) {
 		ret = -ENOMEM;
@@ -705,6 +660,27 @@ static int idtp9418_probe(struct i2c_client *client)
 	}
 
 	dev_info(di->dev, "idtp9418 probe success\n");
+
+	/*
+	 * Pen dock detection lives in the pen dock driver, which owns the hall
+	 * lines. Register only once everything else is up, because the attach
+	 * path reports through the power supply.
+	 */
+	di->pen_dock_nb.notifier_call = idtp9418_pen_dock_notifier_callback;
+	ret = pen_dock_register_notifier(&di->pen_dock_nb);
+	if (ret)
+		dev_warn(di->dev, "register pen dock notifier failed: %d\n",
+			 ret);
+
+	/*
+	 * The dock lines are level held, so a pen that is already docked when
+	 * this driver loads produced no edge and the notifier will not fire
+	 * for it. Apply the current state once.
+	 */
+	di->is_attached = pen_dock_is_docked();
+	if (di->is_attached)
+		schedule_delayed_work(&di->hall_irq_work, 0);
+
 	return 0;
 
 cleanup:

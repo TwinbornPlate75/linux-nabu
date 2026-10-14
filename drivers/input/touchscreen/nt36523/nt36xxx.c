@@ -26,6 +26,7 @@
 #include <linux/debugfs.h>
 #include <linux/of_gpio.h>
 #include <linux/of_irq.h>
+#include <linux/pen_dock.h>
 
 #ifdef CONFIG_DRM
 #include <drm/drm_notifier.h>
@@ -860,7 +861,7 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 
 	input_sync(ts->input_dev);
 
-	if (!ts->pen_support)
+	if (!ts->pen_support || ts->pen_docked)
 		return IRQ_HANDLED;
 
 	// parse and handle pen report
@@ -965,6 +966,76 @@ static int32_t disable_pen_input_device(bool disable)
 nvt_set_pen_enable_out:
 	NVT_LOG("--\n");
 	return ret;
+}
+
+/*
+ * Pen dock detection.
+ *
+ * The pen is held on the tablet body by magnets; while it sits there it is
+ * not usable and its presence disturbs the pen sensing of the IC, so pen
+ * sensing has to stay off for as long as the pen is docked. The hall sensors
+ * next to the pen's park position are owned by the pen dock driver, which
+ * exports the state; the same state also drives the wireless pen charger.
+ */
+static void nvt_pen_dock_work(struct work_struct *work)
+{
+	struct nvt_ts_data *ts_core =
+		container_of(work, struct nvt_ts_data, pen_dock_work);
+	bool docked = pen_dock_is_docked();
+
+	if (docked == ts_core->pen_docked)
+		return;
+
+	ts_core->pen_docked = docked;
+	NVT_LOG("pen is %s the dock\n", docked ? "in" : "out of");
+
+	/* drop the pen state that was reported before the pen got docked */
+	release_pen_event();
+	disable_pen_input_device(docked);
+}
+
+static int nvt_pen_dock_notifier_callback(struct notifier_block *nb,
+					  unsigned long event, void *data)
+{
+	struct nvt_ts_data *ts_core =
+		container_of(nb, struct nvt_ts_data, pen_dock_nb);
+
+	schedule_work(&ts_core->pen_dock_work);
+
+	return NOTIFY_OK;
+}
+
+/*
+ * Subscribe to pen dock state changes and pick up the state the pen happens
+ * to be in right now: the dock lines are level held, so a pen that is already
+ * docked at this point produced no edge and the notifier alone would leave
+ * pen sensing on while the pen sits in the dock.
+ */
+static void nvt_pen_dock_init(void)
+{
+	int32_t ret;
+
+	if (!ts->pen_support)
+		return;
+
+	ts->pen_dock_nb.notifier_call = nvt_pen_dock_notifier_callback;
+	ret = pen_dock_register_notifier(&ts->pen_dock_nb);
+	if (ret)
+		NVT_ERR("register pen dock notifier failed: %d\n", ret);
+
+	ts->pen_docked = pen_dock_is_docked();
+	NVT_LOG("pen dock detection ready, pen is %s the dock\n",
+		ts->pen_docked ? "in" : "out of");
+}
+
+static void nvt_pen_dock_deinit(void)
+{
+	if (!ts->pen_support)
+		return;
+
+	/* stop new work from being queued, then drain the pending one */
+	pen_dock_unregister_notifier(&ts->pen_dock_nb);
+	cancel_work_sync(&ts->pen_dock_work);
 }
 
 static void nvt_suspend_work(struct work_struct *work)
@@ -1232,6 +1303,7 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	}
 	INIT_WORK(&ts->resume_work, nvt_resume_work);
 	INIT_WORK(&ts->suspend_work, nvt_suspend_work);
+	INIT_WORK(&ts->pen_dock_work, nvt_pen_dock_work);
 
 #ifdef CONFIG_DRM
 	ts->drm_notif.notifier_call = nvt_drm_notifier_callback;
@@ -1243,7 +1315,8 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 #endif
 
 	bTouchIsAwake = 1;
-	disable_pen_input_device(false);
+	nvt_pen_dock_init();
+	disable_pen_input_device(ts->pen_docked);
 	NVT_LOG("end\n");
 
 	nvt_irq_enable(true);
@@ -1314,6 +1387,8 @@ static void nvt_ts_remove(struct spi_device *client)
 {
 	NVT_LOG("Removing driver...\n");
 
+	nvt_pen_dock_deinit();
+
 #ifdef CONFIG_DRM
 	if (mi_drm_unregister_client(&ts->drm_notif))
 		NVT_ERR("Error occurred while unregistering drm_notifier.\n");
@@ -1349,6 +1424,8 @@ static void nvt_ts_remove(struct spi_device *client)
 static void nvt_ts_shutdown(struct spi_device *client)
 {
 	NVT_LOG("Shutdown driver...\n");
+
+	nvt_pen_dock_deinit();
 
 	nvt_irq_enable(false);
 
@@ -1463,7 +1540,9 @@ static int32_t nvt_ts_resume(struct device *dev)
 
 	bTouchIsAwake = 1;
 
-	disable_pen_input_device(false);
+	/* a dock change during suspend may have produced no edge we saw */
+	ts->pen_docked = pen_dock_is_docked();
+	disable_pen_input_device(ts->pen_docked);
 	if (likely(ts->ic_state == NVT_IC_RESUME_IN)) {
 		ts->ic_state = NVT_IC_RESUME_OUT;
 	} else {

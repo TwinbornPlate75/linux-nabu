@@ -21,6 +21,7 @@
 
 #include <linux/delay.h>
 #include <linux/input.h>
+#include <linux/notifier.h>
 #include <linux/of.h>
 #include <linux/spi/spi.h>
 #include <linux/uaccess.h>
@@ -83,6 +84,8 @@ struct nvt_ts_data {
 	struct workqueue_struct *event_wq;
 	struct work_struct suspend_work;
 	struct work_struct resume_work;
+	struct work_struct pen_dock_work;
+	struct notifier_block pen_dock_nb;
 	struct completion dev_pm_suspend_completion;
 #ifdef CONFIG_DRM
 	struct notifier_block drm_notif;
@@ -95,6 +98,7 @@ struct nvt_ts_data {
 	bool irq_enabled;
 	bool pen_support;
 	bool wgp_stylus;
+	bool pen_docked;
 	bool dev_pm_suspend;
 	int8_t phys[32];
 	int8_t pen_phys[32];

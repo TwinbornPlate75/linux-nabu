@@ -661,4 +661,17 @@ source "drivers/misc/mchp_pci1xxxx/Kconfig"
 source "drivers/misc/keba/Kconfig"
 source "drivers/misc/amd-sbi/Kconfig"
 source "drivers/misc/rp1/Kconfig"
+
+config PEN_DOCK
+	tristate "Pen dock (magnetic stylus attachment) detection"
+	depends on GPIOLIB
+	help
+	  Detect a stylus parked on the tablet body by magnets, using the hall
+	  sensors next to its park position on the Xiaomi Pad 5. The docked
+	  state is exported together with a notifier, so that the touchscreen
+	  can keep its pen sensing off while the pen is docked and the wireless
+	  pen charger can start charging it.
+
+	  Say Y to build it in, or M to build it as a module. Drivers using it
+	  pull it in automatically when it is a module.
 endmenu

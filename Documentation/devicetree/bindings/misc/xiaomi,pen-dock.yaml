@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/misc/xiaomi,pen-dock.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Xiaomi pen dock (magnetic stylus attachment) detection
+
+maintainers:
+  - TwinbornPlate75 <3342733415@qq.com>
+
+description: |
+  The stylus parks on the side of the tablet, held there by magnets. Hall
+  sensors next to the park position pull their output low while the pen is
+  attached. The state is exported by the pen dock driver so that the
+  touchscreen can keep its pen sensing off while the pen is docked (a docked
+  pen disturbs the digitizer) and the wireless pen charger can start charging.
+
+properties:
+  compatible:
+    const: xiaomi,pen-dock
+
+  pen-dock-gpios:
+    description:
+      Hall sensor outputs, asserted while the pen is attached. One entry per
+      sensor; any asserted sensor means the pen is docked. The state is level
+      held, so a pen that is already docked at probe time produces no edge
+      interrupt.
+    minItems: 1
+    maxItems: 2
+
+  wakeup-source: true
+
+required:
+  - compatible
+  - pen-dock-gpios
+
+additionalProperties: false
+
+examples:
+  - |
+    pen-dock {
+        compatible = "xiaomi,pen-dock";
+        pen-dock-gpios = <&tlmm 101 GPIO_ACTIVE_LOW>,
+                         <&tlmm 134 GPIO_ACTIVE_LOW>;
+        pinctrl-names = "default";
+        pinctrl-0 = <&hall_intr3_active &hall_intr4_active>;
+        wakeup-source;
+    };
