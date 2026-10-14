@@ -18,6 +18,7 @@
 #include "xiaomi_keyboard.h"
 #include <drm/drm_notifier.h>
 #include <linux/gpio_keys.h>
+#include <linux/input-event-codes.h>
 #include <linux/notifier.h>
 #include <linux/input/usbkbd-xiaomi.h>
 
@@ -462,6 +463,10 @@ static int xiaomi_keyboard_lid_notifier_callback(struct notifier_block *self,
 		container_of(self, struct xiaomi_keyboard_data, lid_notif);
 	bool lid_is_closed = *(int *)state;
 	bool changed = false;
+
+	/* the chain carries every switch of the gpio_keys device */
+	if (code != SW_LID)
+		return NOTIFY_DONE;
 
 	mutex_lock(&kbdata->lock);
 	if (lid_is_closed != kbdata->lid_is_closed) {
