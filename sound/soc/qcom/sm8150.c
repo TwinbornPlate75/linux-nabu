@@ -428,6 +428,15 @@ static void sm8150_add_be_ops(struct snd_soc_card *card)
 	int i;
 
 	for_each_card_prelinks(card, i, link) {
+		/*
+		 * Nabu's dummy frontend codec requests delayed DAPM shutdown.
+		 * That keeps the amps on until after the backend stops its
+		 * clocks, so CS35L41 cannot signal PDN_DONE. Stop the frontend
+		 * immediately in hw_free while the backend clocks are still
+		 * running.
+		 */
+		if (of_machine_is_compatible("xiaomi,nabu") && link->dynamic)
+			link->ignore_pmdown_time = 1;
 		if (link->no_pcm == 1) {
 			link->be_hw_params_fixup = sm8150_be_hw_params_fixup;
 			link->ops = &sm8150_be_ops;
