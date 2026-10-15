@@ -445,6 +445,64 @@ static void sm8150_add_be_ops(struct snd_soc_card *card)
 	}
 }
 
+static const struct snd_soc_dapm_widget nabu_speaker_widgets[] = {
+	SND_SOC_DAPM_SPK("BR Speaker", NULL),
+	SND_SOC_DAPM_SPK("TR Speaker", NULL),
+	SND_SOC_DAPM_SPK("BL Speaker", NULL),
+	SND_SOC_DAPM_SPK("TL Speaker", NULL),
+};
+
+static int sm8150_fix_nabu_speaker_routes(struct snd_soc_card *card)
+{
+	static const char * const outputs[] = {
+		"BR SPK", "TR SPK", "BL SPK", "TL SPK",
+	};
+	struct snd_soc_dapm_route *routes;
+	unsigned int found = 0, j;
+	int i;
+
+	if (!of_machine_is_compatible("xiaomi,nabu"))
+		return 0;
+
+	/*
+	 * The legacy Nabu DT feeds the speaker outputs back into the PCM
+	 * frontend, creating a DAPM cycle that stays powered after STOP.
+	 * Repair only that exact four-speaker layout. A corrected DT needs
+	 * no workaround, and unrelated routes must retain their meaning.
+	 */
+	for (i = 0; i < card->num_of_dapm_routes; i++) {
+		const struct snd_soc_dapm_route *r = &card->of_dapm_routes[i];
+
+		if (r->control || strcmp(r->sink, "MultiMedia1 Playback"))
+			continue;
+		for (j = 0; j < ARRAY_SIZE(outputs); j++)
+			if (!strcmp(r->source, outputs[j]))
+				found |= BIT(j);
+	}
+	if (found != GENMASK(3, 0))
+		return 0;
+
+	routes = devm_kmemdup(card->dev, card->of_dapm_routes,
+			      sizeof(*routes) * card->num_of_dapm_routes,
+			      GFP_KERNEL);
+	if (!routes)
+		return -ENOMEM;
+
+	for (i = 0; i < card->num_of_dapm_routes; i++) {
+		if (routes[i].control || strcmp(routes[i].sink, "MultiMedia1 Playback"))
+			continue;
+		for (j = 0; j < ARRAY_SIZE(outputs); j++)
+			if (!strcmp(routes[i].source, outputs[j]))
+				routes[i].sink = nabu_speaker_widgets[j].name;
+	}
+	card->of_dapm_routes = routes;
+	card->dapm_widgets = nabu_speaker_widgets;
+	card->num_dapm_widgets = ARRAY_SIZE(nabu_speaker_widgets);
+	dev_info(card->dev, "corrected Nabu speaker routes to physical endpoints\n");
+
+	return 0;
+}
+
 static int sm8150_platform_probe(struct platform_device *pdev)
 {
 	struct snd_soc_card *card;
@@ -466,6 +524,9 @@ static int sm8150_platform_probe(struct platform_device *pdev)
 	card->owner = THIS_MODULE;
 	dev_set_drvdata(dev, card);
 	ret = qcom_snd_parse_of(card);
+	if (ret)
+		return ret;
+	ret = sm8150_fix_nabu_speaker_routes(card);
 	if (ret)
 		return ret;
 
