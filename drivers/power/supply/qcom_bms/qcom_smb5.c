@@ -108,6 +108,17 @@
 #define USBIN_LOAD_CFG (USBIN_BASE + 0x65)
 #define ICL_OVERRIDE_AFTER_APSD_BIT BIT(4)
 
+/*
+ * The input over/under-voltage comparators follow this selection.  With the
+ * bootloader value the charger flags USBIN_OV as soon as USB-PD raises VBUS to
+ * 9 V, which parks the charger in PAUSE with the buck off (the battery then
+ * drains even though a cable is attached).  Select the 5 V - 12 V range so any
+ * negotiated contract, and a plain 5 V source, is accepted.
+ */
+#define USBIN_ADAPTER_ALLOW_CFG (USBIN_BASE + 0x60)
+#define USBIN_ADAPTER_ALLOW_5V_TO_12V 12
+#define USBIN_ADAPTER_ALLOW_MASK GENMASK(3, 0)
+
 #define USBIN_ICL_OPTIONS (USBIN_BASE + 0x66)
 #define CFG_USB3P0_SEL_BIT BIT(2)
 #define USB51_MODE_BIT BIT(1)
@@ -734,6 +745,9 @@ static irqreturn_t smb_handle_chg_state_change(int irq, void *data)
 }
 
 static const struct smb_init_register smb5_init_seq[] = {
+	{ .addr = USBIN_ADAPTER_ALLOW_CFG,
+	  .mask = USBIN_ADAPTER_ALLOW_MASK,
+	  .val = USBIN_ADAPTER_ALLOW_5V_TO_12V },
 	{ .addr = USBIN_CMD_IL, .mask = USBIN_SUSPEND_BIT, .val = 0 },
 	{ .addr = SMB5_TYPE_C_MODE_CFG,
 	  .mask = SMB5_EN_TRY_SNK_BIT | SMB5_EN_SNK_ONLY_BIT,
